@@ -58,3 +58,26 @@ def test_remote_otel_footer_overview():
     from src.extensions import query_remote_otel_parquet
     env = query_remote_otel_parquet("overview", parts_for_overview=1)
     assert env["total_matching_count"] == 1_000_000_000
+
+
+def test_search_tolerates_punctuation_and_any_terms_is_not_an_expression():
+    assert q.search_logs("BGL", "ciod: failed - read", limit=1)["total_matching_count"] > 0
+    # Text that looks like a query expression is searched as words, not executed.
+    assert q.search_logs("BGL", "ts_like('%')", mode="any_terms", limit=1)["total_matching_count"] < 1000
+    a = q.search_logs("BGL", "parity", limit=1)["total_matching_count"]
+    b = q.search_logs("BGL", "TLB", limit=1)["total_matching_count"]
+    assert q.search_logs("BGL", "parity TLB", mode="any_terms", limit=1)["total_matching_count"] <= a + b
+
+
+def test_search_uses_covering_workspace_index():
+    from src.extensions import manage_workspace_index as ws
+    kw = dict(start_time="2005-06-05T00:00:00", end_time="2005-06-06T00:00:00", limit=1)
+    before = q.search_logs("BGL", "error", **kw)
+    try:
+        ws("create", "BGL", "2005-06-03T00:00:00", "2005-06-10T00:00:00")
+        during = q.search_logs("BGL", "error", **kw)
+        assert during["total_matching_count"] == before["total_matching_count"]
+        assert any("workspace index" in n for n in during["notes"])
+        assert "FROM ws_bgl_logs_" in during["executed_queries"][-1]["sql"]
+    finally:
+        ws("drop", "BGL", "2005-06-03T00:00:00", "2005-06-10T00:00:00")

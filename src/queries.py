@@ -9,7 +9,7 @@ Each function returns an EvidenceEnvelope dict (see src/db.py).
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
 from src.db import DATASET_TABLES, EvidenceBuilder
@@ -19,6 +19,8 @@ SearchMode = Literal["all_terms", "any_terms", "phrase", "substring"]
 BucketSize = Literal["hour", "day", "week"]
 
 MAX_SEARCH_LIMIT = 100
+MAX_SEARCH_TERMS = 8
+WORKSPACE_NAME_RE = re.compile(r"^ws_(?P<table>[a-z_]+)_(?P<start>\d{14})_(?P<end>\d{14})$")
 MAX_WINDOW_LINES = 50
 MAX_AGG_ROWS = 100
 MAX_TREND_ROWS = 150
@@ -56,7 +58,10 @@ def _parse_time(value: Optional[str], name: str) -> Optional[datetime]:
         ts = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError:
         raise ValueError(f"{name} must be ISO-8601 (e.g. 2005-06-03T00:00:00), got {value!r}") from None
-    return ts.replace(tzinfo=None)
+    # Stored timestamps are naive. An explicit offset is converted to UTC rather than dropped.
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
 
 
 def _ts(value: datetime) -> str:
@@ -102,7 +107,7 @@ def _common_filters(dataset: str, start: Optional[datetime], end: Optional[datet
     if end:
         where.add("l.event_time <= %s::TIMESTAMP", _ts(end))
     if component:
-        where.add("l.component = %s", component)
+        where.add("lower(l.component) = lower(%s)", component)
         applied["component"] = component
     if severity:
         where.add("l.severity = %s", severity.upper())
@@ -183,17 +188,24 @@ def search_logs(dataset: str, query_text: str, start_time: Optional[str] = None,
         match.add("l.message ILIKE %s ESCAPE '\\'", f"%{escaped}%")
         source = f"{table} l"
     else:
+        # Tokens without letters or digits (":", "-") analyse to nothing and make ts_phrase fail.
+        terms = list(dict.fromkeys(t for t in query_text.split() if re.search(r"\w", t)))
+        if not terms:
+            raise ValueError("query_text has no searchable words; use mode='substring' for punctuation")
+        if len(terms) > MAX_SEARCH_TERMS and mode != "phrase":
+            raise ValueError(f"at most {MAX_SEARCH_TERMS} terms for {mode}; use mode='phrase' or fewer words")
         if mode == "all_terms":
-            for term in query_text.split()[:8]:
+            for term in terms:
                 match.add("i.message @@ ts_phrase(%s)", term)
+        elif mode == "any_terms":
+            # An OR of phrase predicates; the text is never parsed as a TSQUERY expression.
+            match.add("(" + " OR ".join("i.message @@ ts_phrase(%s)" for _ in terms) + ")", *terms)
         elif mode == "phrase":
             match.add("i.message @@ ts_phrase(%s)", query_text)
-        elif mode == "any_terms":
-            match.add("i.message @@ %s::TSQUERY", query_text)
         else:
             raise ValueError(f"unknown mode {mode!r}")
-        # @@ only resolves against the inverted index relation; join back for filters.
-        source = f"{table}_idx i JOIN {table} l ON l.line_id = i.line_id"
+        index = f"{table}_idx"
+        source = f"{index} i JOIN {table} l ON l.line_id = i.line_id"  # filled in below
 
     predicates = match.parts + where.parts
     sql = f"""
@@ -205,6 +217,14 @@ def search_logs(dataset: str, query_text: str, start_time: Optional[str] = None,
         LIMIT %s
     """
     with EvidenceBuilder("search_logs") as eb:
+        notes = ["Sample rows show examples only; use total_matching_count or the aggregation tools for frequency."]
+        if mode != "substring":
+            # @@ only resolves against an inverted index relation; join back for the filters.
+            # A workspace index covering the whole window answers the same query faster.
+            ws = _covering_workspace_index(eb, table, start, end)
+            if ws:
+                sql = sql.replace(f"FROM {table}_idx i", f"FROM {ws} i", 1)
+                notes.append(f"Served by workspace index {ws}, which covers the requested time window.")
         rows = eb.query(f"{mode} search with exact total count", sql, match.params + where.params + [limit])
         total = int(rows[0]["total_matching_count"]) if rows else 0
         for r in rows:
@@ -218,8 +238,26 @@ def search_logs(dataset: str, query_text: str, start_time: Optional[str] = None,
             truncation_notice=(f"Showing {len(rows)} of {total:,} matching log lines (earliest first). "
                                "Use the summary tools for whole-corpus counts by component or time.")
             if truncated else None,
-            notes=["Sample rows show examples only; use total_matching_count or the aggregation tools for frequency."],
+            notes=notes,
         )
+
+
+def _covering_workspace_index(eb: EvidenceBuilder, table: str, start: Optional[datetime],
+                              end: Optional[datetime]) -> Optional[str]:
+    """Name of a ws_* partial index whose window contains [start, end], if any."""
+    if not start or not end:
+        return None
+    rows = eb.query("find covering workspace index", """
+        SELECT indexname FROM pg_indexes WHERE tablename = %s AND left(indexname, 3) = 'ws_'
+    """, [table])
+    for r in rows:
+        m = WORKSPACE_NAME_RE.match(r["indexname"])
+        if m and m["table"] == table:
+            ws_start = datetime.strptime(m["start"], "%Y%m%d%H%M%S")
+            ws_end = datetime.strptime(m["end"], "%Y%m%d%H%M%S")
+            if ws_start <= start and end <= ws_end:
+                return r["indexname"]
+    return None
 
 
 def get_nearby_events(dataset: str, anchor_line_id: int, window_lines: int = 15,

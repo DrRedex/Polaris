@@ -65,3 +65,21 @@ def test_manager_revision_on_forbidden_claim(db):
     client = _client(lambda **kw: replies.pop(0))
     result = run_agent(Role.MANAGER, "priorities?", client=client, model="test-model")
     assert result.revised_after_validation and result.validation.passed
+
+
+def test_workspace_indexes_created_by_a_run_are_dropped(monkeypatch):
+    import src.agent as agent
+    from src.agent import ToolCallRecord
+    calls = []
+    monkeypatch.setattr(agent, "call_tool", lambda name, args: calls.append((name, args)) or ({}, None))
+    scope = {"index_name": "ws_bgl_logs_20050603000000_20050610000000", "dataset": "BGL",
+             "time_filter_start": "2005-06-03T00:00:00", "time_filter_end": "2005-06-10T00:00:00"}
+    created = ToolCallRecord(name="manage_workspace_index", arguments={"action": "create"}, duration_ms=1,
+                             envelope={"data_scope": scope, "rows": [{"already_existed": False}], "summary": None})
+    reused = ToolCallRecord(name="manage_workspace_index", arguments={"action": "create"}, duration_ms=1,
+                            envelope={"data_scope": {**scope, "index_name": "ws_other"},
+                                      "rows": [{"already_existed": True}], "summary": None})
+    agent._drop_workspace_indexes_created([created, reused])
+    assert calls == [("manage_workspace_index", {"action": "drop", "dataset": "BGL",
+                                                 "start_time": "2005-06-03T00:00:00",
+                                                 "end_time": "2005-06-10T00:00:00"})]

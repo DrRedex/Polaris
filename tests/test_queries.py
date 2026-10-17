@@ -116,3 +116,22 @@ def test_openstack_line_without_message_is_kept(db):
                      "WHERE logger = 'oslo_service.periodic_task'").fetchall()
     assert row and row[0][0] == "ERROR"
     assert db.execute("SELECT COUNT(*) FROM openstack_logs").fetchone()[0] == len(OS_LINES)
+
+
+def test_punctuation_terms_are_ignored_or_rejected(db):
+    with pytest.raises(ValueError, match="no searchable words"):
+        q.search_logs("BGL", "- :", mode="all_terms")
+    with pytest.raises(ValueError, match="at most 8 terms"):
+        q.search_logs("BGL", "a b c d e f g h i", mode="any_terms")
+
+
+def test_component_filter_is_case_insensitive(db):
+    upper = q.search_logs("BGL", "TLB", mode="substring", component="KERNEL")["total_matching_count"]
+    assert upper > 0
+    assert q.search_logs("BGL", "TLB", mode="substring", component="kernel")["total_matching_count"] == upper
+
+
+def test_timezone_offset_converted_to_utc():
+    from src.queries import _parse_time
+    assert _parse_time("2005-06-03T02:00:00+02:00", "t").isoformat() == "2005-06-03T00:00:00"
+    assert _parse_time("2005-06-03T00:00:00Z", "t").isoformat() == "2005-06-03T00:00:00"

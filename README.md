@@ -85,7 +85,7 @@ The server's instructions tell the client the evidence rules and the per-role to
 | Tool | Roles | What it does | Bounds |
 |---|---|---|---|
 | `get_corpus_scope` | Manager | Rows, time span, severity distribution per dataset | – |
-| `search_logs` | Engineer | Full-text search (`all_terms`, `any_terms`, `phrase` via the inverted index; `substring` scan) with time, component and severity filters. Returns the exact `total_matching_count` plus the earliest matches | `limit` 1–100 |
+| `search_logs` | Engineer | Full-text search (`all_terms`, `any_terms`, `phrase` via the inverted index; `substring` scan) with time, component (case-insensitive) and severity filters; ISO times with an offset are converted to UTC. Returns the exact `total_matching_count` plus the earliest matches | `limit` 1–100 |
 | `get_nearby_events` | Engineer | Events before and after an anchor line: on the same node (BGL) or instance/request (OpenStack) ordered by time, or physically adjacent lines | 1–50 each side, ≤7 days |
 | `summarize_by_team_and_component` | Team Lead, Manager | Whole-corpus counts by team × component × severity: log lines, distinct nodes/requests/instances, active days, first/last seen | ≤100 groups; summary covers all |
 | `get_recurring_trends` | Team Lead, Manager | Hour/day/week buckets per component, with per-component persistence, peak and pattern (burst / chronic / increasing / decreasing) | hourly ≤31 days; ≤150 rows |
@@ -152,7 +152,7 @@ All roles share one agent (`src/agent.py`), the same tools and the same corpus. 
 - The same full-text count drops from **85.3 ms to 7.1 ms**, a 12× speed-up, with identical results (216,310).
 - Break-even is **7** queries.
 
-The agent drops the index when done; index names are derived from the validated window, never supplied.
+While the index exists, `search_logs` automatically uses it for full-text searches whose time window lies inside it (the envelope notes this). The OpenAI agent drops any index it created at the end of each question; index names are derived from the validated window, never supplied.
 
 **50 billion rows without downloading them.** `query_remote_otel_parquet` reads the public OpenTelemetry benchmark (`part_000…part_049.parquet`, 1B rows each) in place:
 
@@ -167,8 +167,8 @@ The files are sorted by `Timestamp`, so SereneDB fetches only row groups whose m
 ## Tests
 
 ```bash
-uv run pytest -q              # 31 offline tests: query layer on DuckDB, validator, agent loop with a scripted OpenAI client
-uv run pytest -q -m serenedb  # 10 live tests against the loaded SereneDB (incl. both extensions)
+uv run pytest -q              # 36 offline tests: query layer on DuckDB, validator, agent loop with a scripted OpenAI client
+uv run pytest -q -m serenedb  # 12 live tests against the loaded SereneDB (incl. both extensions)
 ```
 
 The offline suite runs the repo's real `sql/` files and query templates on DuckDB, a near-identical dialect, against fixture logs. Expected values are computed directly from the fixture files. Full-text modes need SereneDB and are covered by the live suite.

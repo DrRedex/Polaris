@@ -9,7 +9,6 @@ Post-checks an agent answer against the evidence it actually retrieved:
      claims. Sentences that state such things are *not* recorded are allowed.
 """
 
-import json
 import re
 from typing import Any
 
@@ -18,12 +17,19 @@ from pydantic import BaseModel
 from src.prompts import Role
 
 # A number not glued to letters, '-' or '.' on the left (skips p95, Tier-1, R02-M1, 0x1b),
-# with an optional k/M/B suffix or percent sign.
-ANSWER_NUMBER_RE = re.compile(r"(?<![\w.\-:/])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s?([kKmMbB]\b|%)?(?![\w\-:])")
-EVIDENCE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+# with an optional k/M/B, million/billion suffix or percent sign.
+ANSWER_NUMBER_RE = re.compile(
+    r"(?<![\w.\-:/])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?\s?(million\b|billion\b|[kKmMbB]\b|%)?(?![\w\-:])")
+# Standalone numbers inside text values (messages, timestamps), not digits glued to letters.
+EVIDENCE_NUMBER_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w])")
+# Identifier fields: digits inside them (hex, UUIDs, node names) are not quantities.
+ID_KEYS = {"request_id", "instance_id", "tenant_id", "user_id", "trace_id", "span_id", "node_id",
+           "line_id", "index_name", "source", "source_file", "log_file", "http_path", "http_route", "url_pattern"}
+# SQL text and bound parameters describe how evidence was produced, not what it says.
+SKIP_KEYS = {"sql", "bound_parameters"}
 DERIVED_RE = re.compile(r"\(derived:[^)]*\)", re.IGNORECASE)
 CITATION_RE = re.compile(r"\[[a-z_]+:[^\]]*\]")
-SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9}
+SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9, "million": 1e6, "billion": 1e9}
 
 FORBIDDEN_RE = re.compile(
     r"[$€£]\s?\d|\b(?:usd|eur|dollars?|euros?|revenue|profit|financial (?:loss|impact)|cost of|costs? \w+ (?:per|an?) "
@@ -52,8 +58,32 @@ class ValidationReport(BaseModel):
 
 
 def _evidence_numbers(envelopes: list[Any]) -> list[float]:
-    text = json.dumps(envelopes, default=str)
-    return [float(n) for n in EVIDENCE_NUMBER_RE.findall(text)]
+    """Numbers the agent was actually shown: numeric values, plus standalone numbers inside
+    text values (messages, timestamps). Identifier fields, SQL and parameters are skipped."""
+    out: list[float] = []
+
+    def walk(value: Any, key: str = "") -> None:
+        if key in SKIP_KEYS or key in ID_KEYS:
+            if key == "line_id" and isinstance(value, int):
+                out.append(float(value))  # line_ids are cited as evidence references
+            return
+        if isinstance(value, bool) or value is None:
+            return
+        if isinstance(value, (int, float)):
+            out.append(float(value))
+        elif isinstance(value, str):
+            out.extend(float(n) for n in EVIDENCE_NUMBER_RE.findall(value))
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                walk(v, str(k))
+                if isinstance(k, str):  # dict keys such as severity_distribution buckets
+                    out.extend(float(n) for n in EVIDENCE_NUMBER_RE.findall(k))
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                walk(v, key)
+
+    walk(envelopes)
+    return out
 
 
 def _matches(value: float, decimals: int, scale: float, evidence: list[float]) -> bool:

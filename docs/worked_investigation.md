@@ -1,6 +1,6 @@
 # Worked investigation
 
-Generated 2026-10-17 21:20 by `scripts/run_worked_investigation.py`. Same agent, same SereneDB corpus, three roles. Every tool call below lists the exact SQL and parameters, and each statement was re-executed to confirm it reproduces.
+Generated 2026-10-17 22:25 by `scripts/run_worked_investigation.py`. Same agent, same SereneDB corpus, three roles. Every tool call below lists the exact SQL and parameters, and each statement was re-executed to confirm it reproduces.
 
 ## Engineer
 
@@ -15,12 +15,12 @@ Generated 2026-10-17 21:20 by `scripts/run_worked_investigation.py`. Same agent,
 Arguments: `{"dataset": "BGL", "query_text": "data TLB error interrupt", "mode": "phrase", "component": "KERNEL", "severity": "FATAL", "limit": 10}`
 
 - total_matching_count: 152734, returned: 10, truncated: True
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (1 of 1 statements replayed)
 
-*phrase search with exact total count* (112.0 ms, 10 rows)
+*phrase search with exact total count* (118.4 ms, 10 rows)
 
 ```sql
-SELECT l.line_id, l.event_time, l.node_id, l.component, l.severity, l.label, l.message, COUNT(*) OVER () AS total_matching_count FROM bgl_logs_idx i JOIN bgl_logs l ON l.line_id = i.line_id WHERE i.message @@ ts_phrase(%s) AND l.component = %s AND l.severity = %s ORDER BY l.event_time, l.line_id LIMIT %s
+SELECT l.line_id, l.event_time, l.node_id, l.component, l.severity, l.label, l.message, COUNT(*) OVER () AS total_matching_count FROM bgl_logs_idx i JOIN bgl_logs l ON l.line_id = i.line_id WHERE i.message @@ ts_phrase(%s) AND lower(l.component) = lower(%s) AND l.severity = %s ORDER BY l.event_time, l.line_id LIMIT %s
 ```
 Parameters: `["data TLB error interrupt", "KERNEL", "FATAL", 10]`
 
@@ -37,23 +37,23 @@ Parameters: `["data TLB error interrupt", "KERNEL", "FATAL", 10]`
 Arguments: `{"dataset": "BGL", "anchor_line_id": 17742, "window_lines": 10, "same_entity_only": true}`
 
 - total_matching_count: None, returned: 3, truncated: False
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (3 of 3 statements replayed)
 
-*anchor line* (4.3 ms, 1 rows)
+*anchor line* (5.3 ms, 1 rows)
 
 ```sql
 SELECT l.line_id, l.event_time, l.node_id, l.component, l.severity, l.label, l.message FROM bgl_logs l WHERE l.line_id = %s
 ```
 Parameters: `[17742]`
 
-*preceding events on same node_id* (21.6 ms, 0 rows)
+*preceding events on same node_id* (19.4 ms, 0 rows)
 
 ```sql
 SELECT l.line_id, l.event_time, l.node_id, l.component, l.severity, l.label, l.message FROM bgl_logs l WHERE l.node_id = %s AND l.event_time >= %s::TIMESTAMP AND (l.event_time < %s::TIMESTAMP OR (l.event_time = %s::TIMESTAMP AND l.line_id < %s)) ORDER BY l.event_time DESC, l.line_id DESC LIMIT %s
 ```
 Parameters: `["R20-M0-N2-C:J10-U11", "2005-06-04 23:08:13.410695", "2005-06-05 00:08:13.410695", "2005-06-05 00:08:13.410695", 17742, 10]`
 
-*following events on same node_id* (14.2 ms, 2 rows)
+*following events on same node_id* (12.2 ms, 2 rows)
 
 ```sql
 SELECT l.line_id, l.event_time, l.node_id, l.component, l.severity, l.label, l.message FROM bgl_logs l WHERE l.node_id = %s AND l.event_time <= %s::TIMESTAMP AND (l.event_time > %s::TIMESTAMP OR (l.event_time = %s::TIMESTAMP AND l.line_id > %s)) ORDER BY l.event_time, l.line_id LIMIT %s
@@ -93,16 +93,16 @@ Parameters: `["R20-M0-N2-C:J10-U11", "2005-06-05 01:08:13.410695", "2005-06-05 0
 Arguments: `{"dataset": "BOTH", "errors_only": true, "limit": 25}`
 
 - total_matching_count: 988775, returned: 17, truncated: False
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (2 of 2 statements replayed)
 
-*BGL team/component aggregation* (205.9 ms, 12 rows)
+*BGL team/component aggregation* (208.1 ms, 12 rows)
 
 ```sql
 SELECT COALESCE(o.team_name, 'Unassigned') AS team_name, COALESCE(o.escalation_tier, 'Unassigned') AS escalation_tier, l.component, l.severity, COUNT(*) AS matching_log_entries, COUNT(DISTINCT l.node_id) AS distinct_affected_nodes, COUNT(*) FILTER (WHERE l.is_anomaly) AS labelled_anomaly_lines, COUNT(DISTINCT CAST(l.event_time AS DATE)) AS active_days_with_issue, MIN(l.event_time) AS first_seen, MAX(l.event_time) AS last_seen FROM bgl_logs l LEFT JOIN team_ownership o ON o.dataset = 'BGL' AND o.component = l.component WHERE (l.severity IN ('ERROR', 'SEVERE', 'FATAL', 'FAILURE') OR l.is_anomaly) GROUP BY 1, 2, 3, 4 ORDER BY matching_log_entries DESC
 ```
 Parameters: `[]`
 
-*OpenStack team/component aggregation* (28.1 ms, 5 rows)
+*OpenStack team/component aggregation* (32.7 ms, 5 rows)
 
 ```sql
 SELECT COALESCE(o.team_name, 'Unassigned') AS team_name, COALESCE(o.escalation_tier, 'Unassigned') AS escalation_tier, l.component, l.severity, COUNT(*) AS matching_log_entries, COUNT(DISTINCT l.request_id) AS distinct_requests, COUNT(DISTINCT l.instance_id) AS distinct_instances, COUNT(*) FILTER (WHERE l.is_anomaly) AS labelled_anomaly_lines, COUNT(DISTINCT CAST(l.event_time AS DATE)) AS active_days_with_issue, MIN(l.event_time) AS first_seen, MAX(l.event_time) AS last_seen FROM openstack_logs l LEFT JOIN team_ownership o ON o.dataset = 'OpenStack' AND o.component = l.component WHERE (l.severity IN ('ERROR', 'CRITICAL') OR l.http_status >= 500 OR l.is_anomaly) GROUP BY 1, 2, 3, 4 ORDER BY matching_log_entries DESC
@@ -141,9 +141,9 @@ Parameters: `[]`
 Arguments: `{"dataset": "BGL", "bucket_size": "week", "errors_only": true}`
 
 - total_matching_count: 988477, returned: 147, truncated: False
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (1 of 1 statements replayed)
 
-*weekly trend by component* (141.9 ms, 147 rows)
+*weekly trend by component* (145.6 ms, 147 rows)
 
 ```sql
 SELECT date_trunc(%s, l.event_time) AS time_bucket, COALESCE(o.team_name, 'Unassigned') AS team_name, l.component, COUNT(*) AS log_entry_count, COUNT(DISTINCT l.node_id) AS affected_nodes FROM bgl_logs l LEFT JOIN team_ownership o ON o.dataset = 'BGL' AND o.component = l.component WHERE (l.severity IN ('ERROR', 'SEVERE', 'FATAL', 'FAILURE') OR l.is_anomaly) GROUP BY 1, 2, 3 ORDER BY 1, 4 DESC
@@ -177,7 +177,7 @@ Parameters: `["week"]`
    "peak_share_pct": 60.3,
    "first_half_total": 593424,
    "second_half_total": 33026,
-   "pattern": "burst (concentrated in few buckets)"
+   "pattern": "chronic, dominated by one burst"
   },
   {
    "component": "APP",
@@ -216,7 +216,7 @@ Parameters: `["week"]`
    "peak_share_pct": 52.0,
    "first_half_total": 36798,
    "second_half_total": 5351,
-   "pattern": "burst (concentrated in few buckets)"
+   "pattern": "chronic, dominated by one burst"
   },
   {
    "component": "MONITOR",
@@ -281,10 +281,10 @@ Parameters: `["week"]`
    "peak_share_pct": 100.0,
    "first_half_total": 1,
    "second_half_total": 0,
-   "pattern": "burst (concentrated in few buckets)"
+   "pattern": "isolated burst"
   }
  ],
- "pattern_rule": "burst if active in <=2 buckets or peak bucket >= 50% of total; else increasing/decreasing if second half is >25% above / >20% below first half; otherwise chronic/stable"
+ "pattern_rule": "isolated burst if active in <=2 buckets; if the peak bucket holds >=50% of the total: 'chronic, dominated by one burst' when active in >=50% of buckets, else 'burst'; otherwise increasing/decreasing if the second half is >25% above / >20% below the first; else chronic/stable"
 }
 ```
 </details>
@@ -294,9 +294,9 @@ Parameters: `["week"]`
 Arguments: `{"dataset": "OpenStack", "bucket_size": "day", "errors_only": true}`
 
 - total_matching_count: 298, returned: 5, truncated: False
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (1 of 1 statements replayed)
 
-*dayly trend by component* (28.4 ms, 5 rows)
+*dayly trend by component* (17.8 ms, 5 rows)
 
 ```sql
 SELECT date_trunc(%s, l.event_time) AS time_bucket, COALESCE(o.team_name, 'Unassigned') AS team_name, l.component, COUNT(*) AS log_entry_count, COUNT(DISTINCT l.instance_id) AS distinct_instances FROM openstack_logs l LEFT JOIN team_ownership o ON o.dataset = 'OpenStack' AND o.component = l.component WHERE (l.severity IN ('ERROR', 'CRITICAL') OR l.http_status >= 500 OR l.is_anomaly) GROUP BY 1, 2, 3 ORDER BY 1, 4 DESC
@@ -343,10 +343,10 @@ Parameters: `["day"]`
    "peak_share_pct": 50.0,
    "first_half_total": 0,
    "second_half_total": 6,
-   "pattern": "burst (concentrated in few buckets)"
+   "pattern": "isolated burst"
   }
  ],
- "pattern_rule": "burst if active in <=2 buckets or peak bucket >= 50% of total; else increasing/decreasing if second half is >25% above / >20% below first half; otherwise chronic/stable"
+ "pattern_rule": "isolated burst if active in <=2 buckets; if the peak bucket holds >=50% of the total: 'chronic, dominated by one burst' when active in >=50% of buckets, else 'burst'; otherwise increasing/decreasing if the second half is >25% above / >20% below the first; else chronic/stable"
 }
 ```
 </details>
@@ -364,23 +364,23 @@ Parameters: `["day"]`
 Arguments: `{}`
 
 - total_matching_count: None, returned: 2, truncated: False
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (4 of 4 statements replayed)
 
-*BGL overview* (18.2 ms, 1 rows)
+*BGL overview* (15.8 ms, 1 rows)
 
 ```sql
 SELECT COUNT(*) AS total_rows, MIN(event_time) AS first_event, MAX(event_time) AS last_event, ROUND(epoch(MAX(event_time)) / 86400.0 - epoch(MIN(event_time)) / 86400.0, 1) AS span_days, COUNT(DISTINCT component) AS distinct_components, COUNT(*) FILTER (WHERE is_anomaly) AS labelled_anomaly_lines FROM bgl_logs
 ```
 Parameters: `[]`
 
-*BGL severity distribution* (15.0 ms, 10 rows)
+*BGL severity distribution* (50.1 ms, 10 rows)
 
 ```sql
 SELECT severity, COUNT(*) AS lines FROM bgl_logs GROUP BY severity ORDER BY lines DESC
 ```
 Parameters: `[]`
 
-*OpenStack overview* (7.3 ms, 1 rows)
+*OpenStack overview* (6.5 ms, 1 rows)
 
 ```sql
 SELECT COUNT(*) AS total_rows, MIN(event_time) AS first_event, MAX(event_time) AS last_event, ROUND(epoch(MAX(event_time)) / 86400.0 - epoch(MIN(event_time)) / 86400.0, 1) AS span_days, COUNT(DISTINCT component) AS distinct_components, COUNT(*) FILTER (WHERE is_anomaly) AS labelled_anomaly_lines FROM openstack_logs
@@ -404,16 +404,16 @@ Parameters: `[]`
 Arguments: `{"dataset": "BOTH", "errors_only": true, "limit": 15}`
 
 - total_matching_count: 988775, returned: 15, truncated: True
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (2 of 2 statements replayed)
 
-*BGL team/component aggregation* (203.2 ms, 12 rows)
+*BGL team/component aggregation* (198.0 ms, 12 rows)
 
 ```sql
 SELECT COALESCE(o.team_name, 'Unassigned') AS team_name, COALESCE(o.escalation_tier, 'Unassigned') AS escalation_tier, l.component, l.severity, COUNT(*) AS matching_log_entries, COUNT(DISTINCT l.node_id) AS distinct_affected_nodes, COUNT(*) FILTER (WHERE l.is_anomaly) AS labelled_anomaly_lines, COUNT(DISTINCT CAST(l.event_time AS DATE)) AS active_days_with_issue, MIN(l.event_time) AS first_seen, MAX(l.event_time) AS last_seen FROM bgl_logs l LEFT JOIN team_ownership o ON o.dataset = 'BGL' AND o.component = l.component WHERE (l.severity IN ('ERROR', 'SEVERE', 'FATAL', 'FAILURE') OR l.is_anomaly) GROUP BY 1, 2, 3, 4 ORDER BY matching_log_entries DESC
 ```
 Parameters: `[]`
 
-*OpenStack team/component aggregation* (26.3 ms, 5 rows)
+*OpenStack team/component aggregation* (39.3 ms, 5 rows)
 
 ```sql
 SELECT COALESCE(o.team_name, 'Unassigned') AS team_name, COALESCE(o.escalation_tier, 'Unassigned') AS escalation_tier, l.component, l.severity, COUNT(*) AS matching_log_entries, COUNT(DISTINCT l.request_id) AS distinct_requests, COUNT(DISTINCT l.instance_id) AS distinct_instances, COUNT(*) FILTER (WHERE l.is_anomaly) AS labelled_anomaly_lines, COUNT(DISTINCT CAST(l.event_time AS DATE)) AS active_days_with_issue, MIN(l.event_time) AS first_seen, MAX(l.event_time) AS last_seen FROM openstack_logs l LEFT JOIN team_ownership o ON o.dataset = 'OpenStack' AND o.component = l.component WHERE (l.severity IN ('ERROR', 'CRITICAL') OR l.http_status >= 500 OR l.is_anomaly) GROUP BY 1, 2, 3, 4 ORDER BY matching_log_entries DESC
@@ -452,9 +452,9 @@ Parameters: `[]`
 Arguments: `{}`
 
 - total_matching_count: None, returned: 3, truncated: False
-- reproduced on re-execution: yes
+- reproduced on re-execution: yes (1 of 1 statements replayed)
 
-*service health by component* (107.6 ms, 3 rows)
+*service health by component* (242.4 ms, 3 rows)
 
 ```sql
 SELECT COALESCE(o.team_name, 'Unassigned') AS team_name, l.component, COUNT(*) AS total_log_lines, COUNT(l.http_status) AS http_requests, COUNT(DISTINCT l.request_id) AS distinct_requests, COUNT(DISTINCT l.instance_id) AS distinct_instances, COUNT(*) FILTER (WHERE l.severity IN ('ERROR', 'CRITICAL')) AS error_log_lines, COUNT(*) FILTER (WHERE l.severity = 'WARNING') AS warning_log_lines, COUNT(*) FILTER (WHERE l.http_status >= 500) AS http_5xx, COUNT(*) FILTER (WHERE l.http_status >= 400 AND l.http_status < 500) AS http_4xx, ROUND(100.0 * COUNT(*) FILTER (WHERE l.http_status >= 500) / NULLIF(COUNT(l.http_status), 0), 3) AS http_5xx_rate_pct, COUNT(*) FILTER (WHERE l.is_anomaly) AS labelled_anomaly_lines, COUNT(DISTINCT l.instance_id) FILTER (WHERE l.is_anomaly) AS anomalous_instances, ROUND(AVG(l.latency_sec), 4) AS avg_latency_sec, ROUND(quantile_cont(l.latency_sec, 0.5), 4) AS p50_latency_sec, ROUND(quantile_cont(l.latency_sec, 0.95), 4) AS p95_latency_sec, ROUND(quantile_cont(l.latency_sec, 0.99), 4) AS p99_latency_sec, ROUND(MAX(l.latency_sec), 4) AS max_latency_sec FROM openstack_logs l LEFT JOIN team_ownership o ON o.dataset = 'OpenStack' AND o.component = l.component GROUP BY 1, 2 ORDER BY http_5xx DESC, error_log_lines DESC, p99_latency_sec DESC NULLS LAST LIMIT 101

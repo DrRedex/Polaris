@@ -14,4 +14,4 @@ def test_remote_part_bounds():
 def test_workspace_name_is_derived_not_supplied():
     from datetime import datetime
     name = extensions._ws_name("bgl_logs", datetime(2005, 6, 3), datetime(2005, 6, 17, 12, 30))
-    assert name == "ws_bgl_logs_200506030000_200506171230"
+    assert name == "ws_bgl_logs_20050603000000_20050617123000"

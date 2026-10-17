@@ -33,7 +33,11 @@ MAX_WORKSPACE_INDEXES = 3
 
 
 def _ws_name(table: str, start: datetime, end: datetime) -> str:
-    return f"ws_{table}_{start:%Y%m%d%H%M}_{end:%Y%m%d%H%M}"
+    # Second precision: search_logs reads the window back from the name (WORKSPACE_NAME_RE)
+    # to decide whether this index covers a query, so it must match the index predicate exactly.
+    if start.microsecond or end.microsecond:
+        raise ValueError("workspace windows are limited to whole seconds")
+    return f"ws_{table}_{start:%Y%m%d%H%M%S}_{end:%Y%m%d%H%M%S}"
 
 
 def _existing_workspace_indexes(eb: EvidenceBuilder) -> list[dict[str, Any]]:
@@ -86,7 +90,9 @@ def manage_workspace_index(action: Literal["create", "benchmark", "drop", "list"
                                          "AND event_time <= %s::TIMESTAMP", [_ts(start), _ts(end)])[0]["n"]
             return eb.envelope(data_scope=scope, rows=[{
                 "index_name": name, "already_existed": created_ms is None,
-                "creation_time_ms": created_ms, "rows_in_window": n}])
+                "creation_time_ms": created_ms, "rows_in_window": n}],
+                notes=["search_logs now uses this index automatically for full-text searches whose time window "
+                       "lies inside this one. Drop it when the investigation ends."])
 
         # benchmark: same full-text count through the full-corpus index (with a time
         # filter) and through the workspace index.
@@ -131,7 +137,9 @@ def manage_workspace_index(action: Literal["create", "benchmark", "drop", "list"
                 "results_identical": counts["full_corpus_index"] == counts["workspace_index"],
             },
             notes=["break_even_queries = ceil(creation_time_ms / avg_saving_per_query_ms): after that many searches "
-                   "in this window the index has paid for itself. Drop it when the investigation ends."],
+                   "in this window the index has paid for itself. Drop it when the investigation ends.",
+                   "While it exists, search_logs uses it automatically for full-text searches whose time window "
+                   "lies inside this one."],
         )
 
 
@@ -275,7 +283,7 @@ def query_remote_otel_parquet(action: Literal["overview", "service_summary", "se
                                                 "search_text": search_text}.items() if v}},
             rows=rows,
             total_matching_count=total,
-            is_truncated=action == "search_body" and total > len(rows),
+            is_truncated=(total > len(rows)) if action == "search_body" else len(rows) >= 100,
             summary={
                 **{k: int(v) if v is not None else None for k, v in pruning.items()},
                 "row_groups_skipped_pct": round(100 * (1 - pruning["row_groups_read"] / pruning["row_groups_in_file"]), 2)

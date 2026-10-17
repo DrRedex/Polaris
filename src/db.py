@@ -87,7 +87,10 @@ class EvidenceEnvelope(BaseModel):
     rows: list[dict[str, Any]]
 
 
-_corpus_rows_cache: dict[str, int] = {}
+# table -> (row count, monotonic time cached). Short-lived so a reload of the corpus while
+# the MCP server or UI keeps running is reflected in data_scope within a minute.
+_corpus_rows_cache: dict[str, tuple[int, float]] = {}
+CORPUS_ROWS_TTL_S = 60.0
 
 
 class EvidenceBuilder:
@@ -135,14 +138,16 @@ class EvidenceBuilder:
         return [to_jsonable(dict(r)) for r in rows]
 
     def corpus_rows(self, dataset: str) -> int:
-        """Total rows in the dataset's base table (cached; the corpus is static after load)."""
+        """Total rows in the dataset's base table (cached for CORPUS_ROWS_TTL_S)."""
         table = DATASET_TABLES[dataset]
-        if table not in _corpus_rows_cache:
+        cached = _corpus_rows_cache.get(table)
+        if cached is None or time.monotonic() - cached[1] > CORPUS_ROWS_TTL_S:
             assert self.conn is not None
             with self.conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) AS n FROM {table}")
-                _corpus_rows_cache[table] = int(cur.fetchone()["n"])
-        return _corpus_rows_cache[table]
+                cached = (int(cur.fetchone()["n"]), time.monotonic())
+            _corpus_rows_cache[table] = cached
+        return cached[0]
 
     def envelope(
         self,

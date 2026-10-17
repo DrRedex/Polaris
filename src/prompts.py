@@ -31,6 +31,9 @@ Evidence rules (mandatory):
    active days before calling a problem widespread.
 5. If a tool returns an error, fix the arguments and retry, or say the evidence is missing.
 6. Never invent revenue, cost, SLA, customer-impact or downtime figures. The logs contain none.
+7. manage_workspace_index is optional: use it only before many searches in one time window
+   (search_logs then uses it automatically). query_remote_otel_parquet is a different dataset
+   (OpenTelemetry benchmark on S3), slow by design: use it only when the question is about it.
 
 Answer in Markdown with exactly these sections, in this order:
 {sections}

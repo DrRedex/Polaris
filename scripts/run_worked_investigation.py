@@ -12,6 +12,7 @@ statement against SereneDB to confirm the evidence reproduces.
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -25,17 +26,41 @@ from src.prompts import DEFAULT_QUESTIONS, Role  # noqa: E402
 from src.workflows import baseline_evidence  # noqa: E402
 
 PREVIEW_ROWS = 5
+WS_FROM_RE = re.compile(r"FROM ws_([a-z_]+?)_\d{14}_\d{14} i")
 
 
-def reproduce(envelope: dict) -> list[str]:
-    """Re-runs each recorded query with its bound parameters and compares row counts."""
-    problems = []
+def _replayable(sql: str) -> bool:
+    # Only read-only statements on the local corpus are replayed. DDL (workspace indexes)
+    # would change state, and remote S3 scans take tens of seconds each.
+    s = sql.lstrip().upper()
+    return (s.startswith(("SELECT", "WITH")) and "READ_PARQUET(" not in s and "PARQUET_METADATA(" not in s
+            and "PG_INDEXES" not in s)
+
+
+def reproduce(envelope: dict) -> tuple[list[str], int]:
+    """Re-runs each replayable query with its bound parameters and compares row counts.
+    Returns (problems, number of queries replayed)."""
+    problems, replayed = [], 0
     with EvidenceBuilder("reproduce") as eb:
         for q in envelope["executed_queries"]:
-            rows = eb.query(q["label"], q["sql"], q["bound_parameters"])
+            if not _replayable(q["sql"]):
+                continue
+            # Workspace indexes are dropped after a run. Searches that went through one carry the
+            # same time filters, so they replay on the main index; benchmark-only queries are skipped.
+            sql = q["sql"]
+            if WS_FROM_RE.search(sql):
+                if " JOIN " not in sql:
+                    continue
+                sql = WS_FROM_RE.sub(r"FROM \1_idx i", sql)
+            try:
+                rows = eb.query(q["label"], sql, q["bound_parameters"])
+            except Exception as e:  # report, keep going
+                problems.append(f"{q['label']}: {type(e).__name__}: {e}")
+                continue
+            replayed += 1
             if len(rows) != q["result_rows"]:
                 problems.append(f"{q['label']}: {len(rows)} rows now vs {q['result_rows']} recorded")
-    return problems
+    return problems, replayed
 
 
 def md_tool_call(i: int, call: dict) -> list[str]:
@@ -43,11 +68,17 @@ def md_tool_call(i: int, call: dict) -> list[str]:
     if call.get("error"):
         return out + [f"Error returned to the agent: `{call['error']}`", ""]
     env = call["envelope"]
-    problems = reproduce(env)
+    problems, replayed = reproduce(env)
+    if problems:
+        verdict = "NO - " + "; ".join(problems)
+    elif replayed:
+        verdict = f"yes ({replayed} of {len(env['executed_queries'])} statements replayed)"
+    else:
+        verdict = "not replayed (DDL, catalog or remote S3 statements only)"
     out += [
         f"- total_matching_count: {env['total_matching_count']}, returned: {env['returned_count']}, "
         f"truncated: {env['is_truncated']}",
-        f"- reproduced on re-execution: {'yes' if not problems else 'NO - ' + '; '.join(problems)}",
+        f"- reproduced on re-execution: {verdict}",
         "",
     ]
     for q in env["executed_queries"]:

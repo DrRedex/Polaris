@@ -36,3 +36,17 @@ def test_manager_disclaimer_allowed():
 
 def test_business_words_allowed_for_other_roles():
     assert not validate_answer(Role.ENGINEER, "No revenue data here.", EVIDENCE).forbidden_claims
+
+
+def test_digits_inside_ids_and_sql_do_not_ground_claims():
+    evidence = [{"executed_queries": [{"sql": "SELECT ... LIMIT 9335", "bound_parameters": [7777]}],
+                 "rows": [{"tenant_id": "54fadb412c4e40cdbaed9335e4c35a9e", "request_id": "req-1234",
+                           "matching_log_entries": 240, "line_id": 104}]}]
+    report = validate_answer(Role.ENGINEER, "We saw 9335 and 7777 and 1234 events.", evidence)
+    assert report.unverified_numbers == ["9335", "7777", "1234"]
+    assert validate_answer(Role.ENGINEER, "Line 104 shows 240 entries.", evidence).passed
+
+
+def test_million_word_suffix():
+    assert validate_answer(Role.ENGINEER, "About 4.7 million lines.", EVIDENCE).passed
+    assert not validate_answer(Role.ENGINEER, "About 9.1 million lines.", EVIDENCE).passed

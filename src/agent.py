@@ -12,10 +12,11 @@ Environment: OPENAI_API_KEY, OPENAI_MODEL (default gpt-4o), loaded from .env.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -48,8 +49,19 @@ class AgentResult(BaseModel):
     usage: dict[str, int]
 
 
+def _run(coro: Coroutine[Any, Any, Any]) -> Any:
+    """asyncio.run that also works when the caller already has a running event loop
+    (Jupyter, async web frameworks): the coroutine then runs on a worker thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 def _openai_tools() -> list[dict[str, Any]]:
-    tools = asyncio.run(mcp.list_tools())
+    tools = _run(mcp.list_tools())
     return [{
         "type": "function",
         "function": {"name": t.name, "description": t.description or "", "parameters": t.input_schema},
@@ -59,7 +71,7 @@ def _openai_tools() -> list[dict[str, Any]]:
 def call_tool(name: str, arguments: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Runs one tool through the MCP server; returns (envelope, error_message)."""
     try:
-        result = asyncio.run(mcp.call_tool(name, arguments))
+        result = _run(mcp.call_tool(name, arguments))
     except Exception as e:  # validation or query errors are reported back to the model
         return None, str(e.__cause__ or e)
     if result.is_error:
@@ -132,6 +144,7 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
                 "content": json.dumps(envelope, default=str) if envelope is not None else f"ERROR: {error}",
             })
 
+    _drop_workspace_indexes_created(records)
     envelopes = [r.envelope for r in records if r.envelope]
     report = validate_answer(role, answer, envelopes)
     revised = False
@@ -146,3 +159,22 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
 
     return AgentResult(role=role, question=question, model=model, answer=answer, tool_calls=records,
                        validation=report, revised_after_validation=revised, usage=usage)
+
+
+def _drop_workspace_indexes_created(records: list[ToolCallRecord]) -> None:
+    """Each question is one investigation: drop workspace indexes this run created and did not drop."""
+    created, dropped = {}, set()
+    for r in records:
+        if r.name != "manage_workspace_index" or not r.envelope:
+            continue
+        scope = r.envelope["data_scope"]
+        if r.arguments.get("action") == "drop":
+            dropped.add(scope.get("index_name"))
+        elif (r.envelope.get("summary") or {}).get("created_in_this_call") or any(
+                row.get("already_existed") is False for row in r.envelope["rows"]):
+            created[scope["index_name"]] = {"action": "drop", "dataset": scope["dataset"],
+                                           "start_time": scope["time_filter_start"],
+                                           "end_time": scope["time_filter_end"]}
+    for name, args in created.items():
+        if name not in dropped:
+            call_tool("manage_workspace_index", args)
