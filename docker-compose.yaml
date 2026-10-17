@@ -1,0 +1,51 @@
+services:
+  serenedb:
+    image: serenedb/serenedb:26.10.1
+    container_name: serenedb
+    restart: unless-stopped
+    environment:
+      # Seeds the superuser password when the data volume is first created.
+      # Non-loopback clients (the host, the app container) need a password.
+      - POSTGRES_PASSWORD=${SERENEDB_PASSWORD:-serenedb}
+    ports:
+      - "127.0.0.1:7890:7890"                 # localhost only
+    volumes:
+      - ./data:/data                          # processed CSVs, read by COPY as /data/processed/*.csv
+      - serenedb-data:/var/lib/serenedb       # database files survive container restarts
+    networks:
+      - serene_internal
+
+  app:
+    build: .
+    container_name: serenedb_streamlit_app
+    restart: unless-stopped
+    environment:
+      - SERENEDB_DSN=postgresql://postgres:${SERENEDB_PASSWORD:-serenedb}@serenedb:7890/postgres
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+    depends_on:
+      - serenedb
+    expose:
+      - "8501"
+    networks:
+      - serene_internal
+
+  nginx:
+    image: nginx:alpine
+    container_name: serenedb_nginx
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    networks:
+      - serene_internal
+
+volumes:
+  serenedb-data:
+
+networks:
+  serene_internal:
+    driver: bridge

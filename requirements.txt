@@ -1,0 +1,9 @@
+# Runtime dependencies (mirrors pyproject.toml; used by the Dockerfile and plain pip installs)
+mcp[cli]>=2.3.0
+openai>=1.60.0
+psycopg[binary]>=3.2.0
+pydantic>=2.9.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+streamlit>=1.45.0
+pandas>=2.0.0
