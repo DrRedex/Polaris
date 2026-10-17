@@ -33,11 +33,20 @@ CLIENT_SIDE_BINDING = os.getenv("SERENEDB_CLIENT_SIDE_BINDING", "0") == "1"
 DATASET_TABLES = {"BGL": "bgl_logs", "OpenStack": "openstack_logs"}
 
 
-def get_connection(autocommit: bool = True) -> psycopg.Connection:
+READER_ROLE = "log_reader"
+
+
+def reader_dsn() -> str:
+    """Connection string of the SELECT-only role used for guarded LLM-written SQL."""
+    return os.getenv("SERENEDB_READER_DSN") or (
+        f"postgresql://{READER_ROLE}:{os.getenv('SERENEDB_READER_PASSWORD', 'log_reader')}@127.0.0.1:7890/postgres")
+
+
+def get_connection(autocommit: bool = True, dsn: Optional[str] = None) -> psycopg.Connection:
     kwargs: dict[str, Any] = {"row_factory": dict_row, "autocommit": autocommit, "connect_timeout": 5}
     if CLIENT_SIDE_BINDING:
         kwargs["cursor_factory"] = psycopg.ClientCursor
-    return psycopg.connect(SERENEDB_DSN, **kwargs)
+    return psycopg.connect(dsn or SERENEDB_DSN, **kwargs)
 
 
 def check_connection() -> dict[str, Any]:
@@ -96,13 +105,14 @@ CORPUS_ROWS_TTL_S = 60.0
 class EvidenceBuilder:
     """Runs parameterized SQL on one connection and records each query for the envelope."""
 
-    def __init__(self, tool_name: str):
+    def __init__(self, tool_name: str, dsn: Optional[str] = None):
         self.tool_name = tool_name
+        self.dsn = dsn
         self.queries: list[ExecutedQuery] = []
         self.conn: Optional[psycopg.Connection] = None
 
     def __enter__(self) -> "EvidenceBuilder":
-        self.conn = get_connection()
+        self.conn = get_connection(dsn=self.dsn) if self.dsn else get_connection()
         return self
 
     def __exit__(self, *exc) -> None:
@@ -159,8 +169,10 @@ class EvidenceBuilder:
         truncation_notice: Optional[str] = None,
         summary: Optional[dict[str, Any]] = None,
         notes: Optional[list[str]] = None,
+        extra: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        return EvidenceEnvelope(
+        """extra: tool-specific top-level fields (e.g. executed_sql, knn_schema_matches)."""
+        envelope = EvidenceEnvelope(
             tool_name=self.tool_name,
             data_scope=data_scope,
             executed_queries=self.queries,
@@ -172,3 +184,6 @@ class EvidenceBuilder:
             notes=notes or [],
             rows=rows,
         ).model_dump()
+        if extra:
+            envelope.update(to_jsonable(extra))
+        return envelope

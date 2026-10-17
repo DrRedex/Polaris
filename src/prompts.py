@@ -34,6 +34,9 @@ Evidence rules (mandatory):
 7. manage_workspace_index is optional: use it only before many searches in one time window
    (search_logs then uses it automatically). query_remote_otel_parquet is a different dataset
    (OpenTelemetry benchmark on S3), slow by design: use it only when the question is about it.
+8. Prefer the parameterized tools. For a vague question you may call resolve_semantic_schema to
+   find the right tool. Use execute_guarded_readonly_sql only when no tool can express the
+   question; cite its total_matching_count like any other tool result.
 
 Answer in Markdown with exactly these sections, in this order:
 {sections}

@@ -23,7 +23,7 @@ Millions of log lines don't fit in an LLM context window, so the work is split:
  └───────────────────────────────────────────┬──────────────────────────────────────────────┘
                                              │
  ┌──────────────── MCP server (src/mcp_server.py, stdio / SSE / streamable HTTP) ────────────┐
- │ 8 typed, bounded tools                                                                    │
+ │ 10 typed, bounded tools                                                                    │
  └───────────────┬───────────────────────────────────────────────┬──────────────────────────┘
                  │                                               │
      Claude Code / Claude Desktop                 OpenAI agent (src/agent.py) + grounding validator
@@ -91,9 +91,33 @@ The server's instructions tell the client the evidence rules and the per-role to
 | `get_recurring_trends` | Team Lead, Manager | Hour/day/week buckets per component, with per-component persistence, peak and pattern (burst / chronic / increasing / decreasing) | hourly ≤31 days; ≤150 rows |
 | `get_openstack_latency_and_errors` | All | Per service or HTTP route: requests, 4xx/5xx, 5xx rate, ERROR/WARNING lines, anomalous instances, AVG/P50/P95/P99/MAX latency | ≤100 groups |
 | `manage_workspace_index` | All (optional) | Agent-managed partial full-text index over one time window: create / benchmark / list / drop | ≤3 indexes |
+| `resolve_semantic_schema` | All | Semantic KNN over a glossary of the real schema: confidence-scored columns, each table's time/id/join columns, the recommended parameterized tool, and a sandbox prompt for writing SQL. Runs no SQL | `k` 1–10 |
+| `execute_guarded_readonly_sql` | All (fallback) | Runs one LLM-written `SELECT` after deterministic guardrails, as a SELECT-only role, returning `executed_sql`, `knn_schema_matches`, exact total and truncation | LIMIT ≤100 (default 50), 30 s timeout |
 | `query_remote_otel_parquet` | All (optional) | Zero-download SQL on the 50B-row OTel Parquet benchmark on S3: footer overview, service summary, Body search | window ≤30 s; 150 s timeout |
 
-Tool arguments are typed and range-checked (Pydantic, enforced by the MCP layer), and every value is bound as a SQL parameter. The LLM never writes SQL.
+Tool arguments are typed and range-checked (Pydantic, enforced by the MCP layer), and every value is bound as a SQL parameter. The eight parameterized tools are the primary path; the LLM writes SQL only through the guarded fallback below.
+
+### Semantic schema grounding and guarded SQL (fallback)
+
+For questions none of the parameterized tools can express, a two-step pipeline lets the agent write its own query safely.
+
+**Step 1: semantic grounding** (`src/semantic_layer.py`, tool `resolve_semantic_schema`).
+- A glossary describes 25 real columns across `bgl_logs`, `openstack_logs` and `team_ownership`, each with a `recommended_mcp_tool`.
+- The glossary is embedded once with `all-MiniLM-L6-v2`; the model is lazy-loaded, cached for the process, and warmed up in the background when the MCP server starts.
+- Each question is matched by exact cosine-similarity KNN in NumPy (about 20 ms after warm-up). Every matched table's time, id and join columns are always added.
+- Example: "Customers keep complaining the cloud API is sluggish and times out" matches `openstack_logs.latency_sec`, `http_route` and `http_status` (top confidence ~0.38), and recommends `get_openstack_latency_and_errors`. Most vague questions end here: the agent calls that tool rather than writing SQL.
+
+**Step 2: deterministic guardrails** (`src/guarded_sql_agent.py`, tool `execute_guarded_readonly_sql`). The candidate SQL is checked before it reaches the database:
+1. Markdown fences and comments are stripped, but string literals are preserved.
+2. Internal `;` is rejected (one statement only).
+3. Write and DDL keywords are rejected, but only outside string literals, so `message ILIKE '%delete%'` is allowed.
+4. The query must start with `SELECT` or `WITH`.
+5. The query is parsed with sqlglot, and only `bgl_logs`, `openstack_logs`, `team_ownership` and their `*_idx` full-text indexes may appear. Table functions are rejected: in SereneDB a plain `SELECT * FROM read_csv('/etc/passwd')` reads server files, which a keyword filter alone would allow. System catalogs, other schemas, file-path `FROM '…'` and CTEs that shadow a real table are rejected too.
+6. A top-level `LIMIT` is added (default 50) or clamped (max 100).
+
+The query then runs as `log_reader`, a SELECT-only database role created by `load_corpus.py`, with a 30 s timeout. The database itself therefore refuses writes even if a check were bypassed. The envelope adds an exact `total_matching_count` (a `COUNT(*)` over the query without its LIMIT) and `is_truncated`.
+
+The Streamlit page has a *Semantic schema & guarded SQL* panel that shows the KNN confidence table, the sandbox prompt, an optional OpenAI-generated candidate, and the executed SQL.
 
 ### Evidence envelope
 
@@ -167,8 +191,8 @@ The files are sorted by `Timestamp`, so SereneDB fetches only row groups whose m
 ## Tests
 
 ```bash
-uv run pytest -q              # 36 offline tests: query layer on DuckDB, validator, agent loop with a scripted OpenAI client
-uv run pytest -q -m serenedb  # 12 live tests against the loaded SereneDB (incl. both extensions)
+uv run pytest -q              # 61 offline tests: query layer on DuckDB, validator, agent loop, semantic KNN, SQL guardrails
+uv run pytest -q -m serenedb  # 16 live tests against the loaded SereneDB (incl. extensions, guarded SQL, read-only role)
 ```
 
 The offline suite runs the repo's real `sql/` files and query templates on DuckDB, a near-identical dialect, against fixture logs. Expected values are computed directly from the fixture files. Full-text modes need SereneDB and are covered by the live suite.
@@ -190,6 +214,7 @@ The offline suite runs the repo's real `sql/` files and query templates on DuckD
 
 ```
 src/        db.py (connection + EvidenceEnvelope) · queries.py (core tools) · extensions.py (workspace index, remote Parquet)
+            semantic_layer.py (KNN schema grounding) · guarded_sql_agent.py (sandbox prompt, SQL guardrails, read-only execution)
             mcp_server.py · agent.py (OpenAI loop) · prompts.py · validator.py · workflows.py (no-LLM tool sequences)
 sql/        01 schema · 02 load + inverted indexes · 03 team ownership · 04 remote OTel views (optional)
 scripts/    download_corpus.sh · prepare_logs.py · load_corpus.py · run_worked_investigation.py

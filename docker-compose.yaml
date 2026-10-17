@@ -21,10 +21,14 @@ services:
     restart: unless-stopped
     environment:
       - SERENEDB_DSN=postgresql://postgres:${SERENEDB_PASSWORD:-serenedb}@serenedb:7890/postgres
+      # SELECT-only role used for guarded LLM-written SQL (created by scripts/load_corpus.py)
+      - SERENEDB_READER_DSN=postgresql://log_reader:${SERENEDB_READER_PASSWORD:-log_reader}@serenedb:7890/postgres
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
     depends_on:
       - serenedb
+    volumes:
+      - hf-cache:/root/.cache/huggingface    # embedding model (~90 MB), downloaded once
     expose:
       - "8501"
     networks:
@@ -45,6 +49,7 @@ services:
 
 volumes:
   serenedb-data:
+  hf-cache:
 
 networks:
   serene_internal:

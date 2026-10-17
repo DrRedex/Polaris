@@ -103,6 +103,6 @@ def duck(processed_dir):
 def db(duck, monkeypatch):
     """Routes src.db connections to the DuckDB fixture."""
     import src.db as dbmod
-    monkeypatch.setattr(dbmod, "get_connection", lambda autocommit=True: _DuckConn(duck))
+    monkeypatch.setattr(dbmod, "get_connection", lambda autocommit=True, dsn=None: _DuckConn(duck))
     monkeypatch.setattr(dbmod, "_corpus_rows_cache", {})
     return duck

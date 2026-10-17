@@ -12,6 +12,11 @@ dependencies = [
     "rich>=13.0.0",
     "streamlit>=1.45.0",
     "pandas>=2.0.0",
+    # Semantic schema grounding (src/semantic_layer.py) and guarded SQL (src/guarded_sql_agent.py)
+    "numpy>=1.26.0",
+    "sentence-transformers>=3.0.0",
+    "torch>=2.5.0",
+    "sqlglot>=25.0.0",
 ]
 
 [dependency-groups]
@@ -22,6 +27,15 @@ dev = [
 
 [tool.uv]
 package = false
+
+# CPU-only PyTorch: the default Linux wheel bundles CUDA (~2.5 GB) that the embedding model does not need.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

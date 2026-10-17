@@ -13,13 +13,15 @@ Register with Claude Code:
 """
 
 import argparse
+import os
+import threading
 from typing import Annotated, Any, Literal, Optional
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from src import extensions, queries
+from src import extensions, guarded_sql_agent, queries
 
 INSTRUCTIONS = """\
 Tools over two Loghub corpora loaded in a local SereneDB: BGL (Blue Gene/L supercomputer,
@@ -42,6 +44,8 @@ Typical flows:
   get_openstack_latency_and_errors.
 - Deep dive on one time window: manage_workspace_index(create or benchmark) first, drop when done.
 - query_remote_otel_parquet works on a separate 50B-row OpenTelemetry benchmark on S3, not on BGL/OpenStack.
+- Vague question that no tool fits: resolve_semantic_schema first (it usually names the right tool);
+  only if no tool fits, write one SELECT from its sandbox_prompt and run execute_guarded_readonly_sql.
 """
 
 mcp = MCPServer("making-sense-of-logs", instructions=INSTRUCTIONS)
@@ -207,12 +211,49 @@ def query_remote_otel_parquet(
                                                 service_name, severity, search_text, limit)
 
 
+@mcp.tool(annotations=READ_ONLY)
+def resolve_semantic_schema(
+    user_query: Annotated[str, Field(description="The question in plain language, e.g. 'customers say the API is slow'")],
+    k: Annotated[int, Field(ge=1, le=10, description="Number of semantic (KNN) column matches")] = 4,
+) -> dict[str, Any]:
+    """Maps a vague question onto SereneDB tables/columns and the best parameterized tool (all roles).
+
+    Semantic KNN (all-MiniLM-L6-v2 embeddings, cosine similarity) over a glossary of the real
+    schema. Returns confidence scores, matched columns plus each table's time/id/join columns,
+    recommended_tools, and sandbox_prompt: the constrained instructions for writing a
+    read-only query when no parameterized tool fits. Runs no SQL.
+    """
+    return guarded_sql_agent.resolve_semantic_schema(user_query, k)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def execute_guarded_readonly_sql(
+    user_query: Annotated[str, Field(description="The question the SQL answers (used for schema grounding)")],
+    candidate_sql: Annotated[str, Field(description="One read-only SELECT over bgl_logs, openstack_logs, team_ownership "
+                                                    "or their *_idx full-text indexes")],
+) -> dict[str, Any]:
+    """Fallback: run one LLM-written SELECT after deterministic guardrails (all roles).
+
+    Use only when no parameterized tool can answer. The query is rejected if it has more than one
+    statement, write/DDL keywords outside string literals, table functions (read_csv, ...) or
+    tables outside the corpus; a LIMIT (default 50, max 100) is enforced. It runs as a
+    SELECT-only database role with a 30 s timeout and returns an evidence envelope with
+    executed_sql, knn_schema_matches, exact total_matching_count and is_truncated.
+    """
+    return guarded_sql_agent.execute_guarded_readonly_sql(user_query, candidate_sql)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Making Sense of Logs MCP server")
     ap.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
+    if os.getenv("SEMANTIC_WARMUP", "1") == "1":
+        # Load the embedding model in the background so the first resolve_semantic_schema call
+        # does not pay the ~20 s PyTorch import; the parameterized tools are usable immediately.
+        from src import semantic_layer
+        threading.Thread(target=semantic_layer.get_glossary_matrix, daemon=True).start()
     if args.transport == "stdio":
         mcp.run()
     else:

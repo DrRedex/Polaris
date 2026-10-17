@@ -18,7 +18,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import db  # noqa: E402
-from src.agent import run_agent  # noqa: E402
+from src.agent import call_tool, run_agent  # noqa: E402
 from src.prompts import DEFAULT_QUESTIONS, ROLE_PROMPTS, Role  # noqa: E402
 from src.workflows import baseline_evidence  # noqa: E402
 
@@ -34,7 +34,22 @@ def corpus_scope() -> list[dict]:
     return get_corpus_scope()["rows"]
 
 
+def render_knn(matches: list[dict]) -> None:
+    st.caption("Semantic schema grounding (KNN, all-MiniLM-L6-v2 cosine similarity)")
+    st.dataframe(pd.DataFrame([{
+        "confidence": m["confidence_score"], "match": m["match_type"],
+        "table.column": f"{m['schema_match']['table']}.{m['schema_match']['column']}",
+        "type": m["schema_match"]["type"], "recommended tool": m["schema_match"]["recommended_mcp_tool"],
+    } for m in matches]), width="stretch", hide_index=True,
+        column_config={"confidence": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="%.3f")})
+
+
 def render_envelope(env: dict) -> None:
+    if env.get("knn_schema_matches"):
+        render_knn(env["knn_schema_matches"])
+    if env.get("executed_sql"):
+        st.caption("Guarded SQL as executed (read-only role, LIMIT enforced)")
+        st.code(env["executed_sql"], language="sql")
     cols = st.columns(4)
     cols[0].metric("Total matching", "—" if env["total_matching_count"] is None else f"{env['total_matching_count']:,}")
     cols[1].metric("Returned rows", env["returned_count"])
@@ -150,6 +165,43 @@ if evidence_only:
         calls = baseline_evidence(role)
     st.session_state.history.insert(0, {"role": role, "question": "Standard evidence", "kind": "evidence",
                                         "payload": calls})
+
+with st.expander("🧭 Semantic schema & guarded SQL (fallback when no tool fits)"):
+    st.caption("Step 1 maps a vague question to SereneDB columns and the best parameterized tool. "
+               "Step 2 runs one LLM-written SELECT only after deterministic guardrails, as a read-only role.")
+    sem_q = st.text_input("Question", "Customers say the cloud API is sluggish and timing out", key="sem_q")
+    if st.button("1. Resolve schema (KNN)", key="sem_resolve"):
+        with st.spinner("Embedding question (first call loads the model)…"):
+            env, err = call_tool("resolve_semantic_schema", {"user_query": sem_q, "k": 4})
+        st.session_state.sem_env, st.session_state.sem_err = env, err
+    if st.session_state.get("sem_err"):
+        st.error(st.session_state.sem_err)
+    sem_env = st.session_state.get("sem_env")
+    if sem_env:
+        tools = sem_env["summary"]["recommended_tools"]
+        st.success(f"Recommended tool: `{tools[0]['tool']}` (score {tools[0]['score']})" if tools else "No tool match")
+        render_knn(sem_env["knn_schema_matches"])
+        with st.popover("Sandbox prompt"):
+            st.code(sem_env["sandbox_prompt"], language="markdown")
+        if st.button("Generate candidate SQL with OpenAI", disabled=not has_key, key="sem_gen"):
+            from src.guarded_sql_agent import generate_candidate_sql
+            try:
+                st.session_state.sem_sql = generate_candidate_sql(sem_env["sandbox_prompt"], model=model)
+            except Exception as e:
+                st.error(str(e))
+    sem_sql = st.text_area("Candidate SQL (untrusted)", st.session_state.get(
+        "sem_sql", "SELECT http_route, COUNT(*) AS requests, ROUND(quantile_cont(latency_sec, 0.95), 3) AS p95\n"
+                   "FROM openstack_logs WHERE latency_sec IS NOT NULL GROUP BY http_route ORDER BY p95 DESC"),
+        height=120, key=f"sem_sql_box_{hash(st.session_state.get('sem_sql', ''))}")
+    if st.button("2. Validate & run guarded SQL", disabled=status["status"] != "connected", key="sem_run"):
+        env, err = call_tool("execute_guarded_readonly_sql", {"user_query": sem_q, "candidate_sql": sem_sql})
+        if err:
+            st.error(f"Blocked: {err}")
+        else:
+            st.session_state.history.insert(0, {"role": role, "question": f"Guarded SQL: {sem_q}", "kind": "evidence",
+                                                "payload": [{"name": "execute_guarded_readonly_sql",
+                                                             "arguments": {"user_query": sem_q}, "envelope": env,
+                                                             "error": None}]})
 
 if st.session_state.history:
     latest, *older = st.session_state.history
