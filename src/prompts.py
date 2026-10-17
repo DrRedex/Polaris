@@ -22,10 +22,13 @@ OpenStack (nova-api / nova-compute / nova-scheduler). You can only see them thro
 tools. All counting and searching happens in the database.
 
 Evidence rules (mandatory):
-1. Every number you state must appear in a tool result. After each factual claim, cite it
-   as [tool_name: field=value], e.g. [search_logs: total_matching_count=1482].
-2. If you compute a figure yourself (a share, ratio or difference), mark it inline as
-   (derived: <formula using cited figures>), e.g. (derived: 240/395 = 60.8%).
+1. Every tool result has an evidence_id (EV-01, EV-02, ...). End EVERY sentence, bullet or
+   table row that states a fact or a number with its source ID in brackets, e.g.
+   "KERNEL FATAL produced 626,450 lines [EV-02]." Cite several as [EV-01, EV-03]. A number
+   must appear in the evidence it cites: a deterministic verifier checks each one.
+2. If you compute a figure yourself (a share, ratio, difference or unit conversion), mark it
+   inline as (derived: <formula> = <result>) and always write the result after "=", e.g.
+   (derived: 240/395 = 60.8%) or (derived: 720 / 60 = 12 minutes).
 3. Never estimate frequency from sample rows. Use total_matching_count or the summary tools.
 4. Log lines are not incidents. Weigh line counts against distinct nodes/instances and
    active days before calling a problem widespread.
@@ -49,11 +52,14 @@ ROLE_PROMPTS = {
 Workflow:
 1. search_logs for the symptom (narrow with component, severity and a time window when
    known). Note total_matching_count.
-2. Pick 1-2 representative line_ids and call get_nearby_events (same_entity_only=true) to
-   see precursors and aftermath on the same node / instance. Use same_entity_only=false
+   For slow or stuck OpenStack operations, call get_latency_outliers: it finds calls far above
+   their own median (MAD rule), including silent INFO-level slow VM spawns.
+2. You MUST then call get_nearby_events (same_entity_only=true) on 1-2 representative
+   line_ids before answering, to see precursors and aftermath on the same node / instance. Use same_entity_only=false
    when you need surrounding activity on other nodes or services.
 3. For OpenStack failures, check get_openstack_latency_and_errors for the affected service.
-Be technical and specific: node IDs, line_ids, timestamps, exact messages.""",
+Be technical and specific: node IDs, line_ids, timestamps, exact messages, and the exact
+counts (total_matching_count, events before/after) with their [EV-XX].""",
         "sections": """\
 ## Observed facts
 ## Event timeline (anchor with preceding and following events, relative times)
@@ -66,14 +72,17 @@ Be technical and specific: node IDs, line_ids, timestamps, exact messages.""",
         "workflow": """\
 Workflow:
 1. summarize_by_team_and_component (BOTH, errors_only=true) for whole-corpus counts per
-   team / component / severity.
+   team / component / severity. Use burst_count_30m (incidents, not lines), top_node_share_pct
+   (near 100 = one faulty node, low = widespread) and current vs previous period bursts.
 2. get_recurring_trends (BGL: week; OpenStack: hour or day over its time span) to tell
    bursts from chronic problems; use summary.components (pattern, persistence_pct, peak).
-3. search_logs with limit=5 on the top recurring component to quote the message
-   that drives the count.
+3. search_logs with limit=5 on the top recurring component to quote the message that
+   drives the count: pass component= and severity= as filters and a word from the
+   messages as query_text (e.g. "error", "interrupt"), not the component name itself.
+4. get_latency_outliers for OpenStack performance regressions that never log an error.
 Focus on recurrence, ownership and triage order, not single-event root cause.""",
         "sections": """\
-## Observed frequency and trends (a Markdown table: dataset, team, component, log lines, distinct nodes/instances, active days, pattern)
+## Observed frequency and trends (a Markdown table: dataset, team, component, log lines, bursts (30 min), distinct nodes/instances, top-node share, active days, burst growth, pattern; cite [EV-XX] in each row)
 ## Representative messages
 ## Hypotheses
 ## What the logs do not establish
@@ -84,7 +93,8 @@ Focus on recurrence, ownership and triage order, not single-event root cause."""
         "workflow": """\
 Workflow:
 1. get_corpus_scope for the exact scope (rows, time span) of each dataset.
-2. summarize_by_team_and_component (BOTH, errors_only=true).
+2. get_priority_ranking (BOTH): the deterministic priority_score orders the priority matrix;
+   quote the score and the factors behind it (bursts, growth, breadth, days, severity).
 3. get_recurring_trends for the top components to check persistence and direction.
 4. get_openstack_latency_and_errors for service error rates and latency.
 Write for a non-specialist: short, plain sentences, no raw log lines.
@@ -93,13 +103,25 @@ trend direction, latency/error rates and escalation tier. Business impact (reven
 cost, SLA penalties, customer impact, downtime) is NOT in the logs: do not mention any
 figure for it, do not speculate about it.""",
         "sections": """\
-## Priority matrix (top 3 problems: rank, problem, owning team and tier, measured frequency, breadth, trend)
+## Priority matrix (top 3 from get_priority_ranking: rank, problem, owning team and tier, priority_score, bursts, breadth, trend; cite [EV-XX] in each row)
 ## Recommended actions (which team does what first, and why)
 ## Hypotheses
 ## What the logs do not establish
-## Scope and boundaries (dataset rows and time spans from get_corpus_scope; state that revenue, SLA, customer impact and downtime are not recorded and were excluded)""",
+## Scope and boundaries (dataset rows and time spans from get_corpus_scope; list the unknown_not_in_logs items from get_priority_ranking and state that revenue, SLA, customer impact and downtime are not recorded and were excluded)""",
     },
 }
+
+
+def required_sections(role: Role) -> list[str]:
+    """The '## ...' section titles a role's answer must contain (text before any parenthesis)."""
+    return [line[3:].split("(")[0].strip() for line in ROLE_PROMPTS[role]["sections"].splitlines()
+            if line.startswith("## ")]
+
+
+def missing_sections(role: Role, answer: str) -> list[str]:
+    headings = [line.lstrip("#").strip().lower() for line in answer.splitlines() if line.lstrip().startswith("#")]
+    return [s for s in required_sections(role)
+            if not any(h.startswith(s.lower()[:24]) for h in headings)]
 
 
 def system_prompt(role: Role) -> str:

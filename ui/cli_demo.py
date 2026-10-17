@@ -35,6 +35,8 @@ console = Console()
 
 def show_envelope(env: dict, show_sql: bool) -> None:
     total = env["total_matching_count"]
+    if env.get("unknown_not_in_logs"):
+        console.print(f"   [yellow]not in logs: {', '.join(env['unknown_not_in_logs'])}[/yellow]")
     console.print(f"   [dim]returned {env['returned_count']} rows"
                   + (f" of {total:,}" if total is not None else "")
                   + (" (truncated)" if env["is_truncated"] else "") + "[/dim]")
@@ -49,7 +51,8 @@ def run_role(role: Role, question: str, show_sql: bool, evidence_only: bool) -> 
     console.print(f"[italic]{question}[/italic]\n")
     if evidence_only:
         for call in baseline_evidence(role):
-            console.print(f"🔧 [cyan]{call['name']}[/cyan] {json.dumps(call['arguments'])}")
+            console.print(f"🔧 [bold]{call.get('evidence_id') or '--'}[/bold] [cyan]{call['name']}[/cyan] "
+                          f"{json.dumps(call['arguments'])}")
             if call["error"]:
                 console.print(f"   [red]{call['error']}[/red]")
             else:
@@ -60,6 +63,7 @@ def run_role(role: Role, question: str, show_sql: bool, evidence_only: bool) -> 
         if kind == "tool_call":
             console.print(f"🔧 [cyan]{data['name']}[/cyan] {json.dumps(data['arguments'])}")
         elif kind == "tool_result":
+            console.print(f"   [bold]{data.get('evidence_id') or '--'}[/bold]")
             if data.get("error"):
                 console.print(f"   [red]error: {data['error']}[/red]")
             else:
@@ -73,8 +77,11 @@ def run_role(role: Role, question: str, show_sql: bool, evidence_only: bool) -> 
     style = "green" if v.passed else "yellow"
     console.print(Panel(Markdown(result.answer), title=f"{role.value} answer", border_style=style))
     table = Table(show_header=False, box=None)
-    table.add_row("Grounding check", f"[{style}]{'passed' if v.passed else 'issues'}[/{style}] "
-                  f"({v.numbers_checked} figures checked)")
+    table.add_row("Claim check", f"[{style}]{'passed' if v.passed else 'issues'}[/{style}] "
+                  f"verified_number_rate={v.verified_number_rate:.2%} ({v.numbers_verified}/{v.numbers_checked}), "
+                  f"{v.cited_sentences}/{v.sentences_checked} sentences cited, {v.elapsed_ms:.1f} ms")
+    if v.stripped_sentences:
+        table.add_row("Stripped", " | ".join(v.stripped_sentences))
     if v.unverified_numbers:
         table.add_row("Unverified figures", ", ".join(v.unverified_numbers))
     if v.forbidden_claims:

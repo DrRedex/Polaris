@@ -7,11 +7,15 @@
 -- SereneDB *server* sees (/data inside the docker-compose container).
 -- ============================================================================
 
--- Views read the processed files in place without materializing rows.
-CREATE OR REPLACE VIEW v_bgl_raw AS
+-- Views read the processed files in place without materializing rows. Dropped first:
+-- CREATE OR REPLACE cannot change a view's columns when the CSV layout changes.
+DROP VIEW IF EXISTS v_bgl_raw;
+DROP VIEW IF EXISTS v_openstack_raw;
+
+CREATE VIEW v_bgl_raw AS
 SELECT * FROM read_csv('{{DATA_DIR}}/processed/bgl_logs.csv', header = true);
 
-CREATE OR REPLACE VIEW v_openstack_raw AS
+CREATE VIEW v_openstack_raw AS
 SELECT * FROM read_csv('{{DATA_DIR}}/processed/openstack_logs.csv', header = true);
 
 DESCRIBE SELECT * FROM v_bgl_raw;
@@ -62,7 +66,9 @@ CREATE TABLE openstack_logs (
     http_route      VARCHAR,        -- http_path with tenant/instance IDs replaced by {id}
     http_status     INTEGER,
     response_bytes  BIGINT,
-    latency_sec     DOUBLE,
+    latency_sec     DOUBLE,         -- nova-api HTTP request latency
+    operation       VARCHAR,        -- 'GET /v2/{id}/servers/detail' or 'spawn the instance on the hypervisor'
+    duration_sec    DOUBLE,         -- latency_sec for HTTP lines; X from "Took X seconds to <operation>"
     anomaly_label   VARCHAR,        -- 'Anomaly' if instance_id is in anomaly_labels.txt
     is_anomaly      BOOLEAN,
     message         VARCHAR

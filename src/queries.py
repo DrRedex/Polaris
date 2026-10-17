@@ -358,28 +358,119 @@ def _count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
 # Team Lead / Manager: whole-corpus aggregations
 # ----------------------------------------------------------------------------
 
-def _team_component_sql(dataset: str, where: _Where) -> str:
-    entity = ("COUNT(DISTINCT l.node_id) AS distinct_affected_nodes,"
-              if dataset == "BGL" else
-              "COUNT(DISTINCT l.request_id) AS distinct_requests,\n"
-              "COUNT(DISTINCT l.instance_id) AS distinct_instances,")
-    return f"""
+BURST_GAP_SEC = 1800  # lines on the same component/severity less than 30 min apart form one burst
+
+# Severity weights for the priority score (FATAL/ERROR vs WARNING).
+SEVERITY_WEIGHT_SQL = """CASE
+            WHEN s.severity IN ('FATAL', 'FAILURE', 'CRITICAL') THEN 1.0
+            WHEN s.severity = 'SEVERE' THEN 0.9
+            WHEN s.severity = 'ERROR' THEN 0.8
+            WHEN s.severity IN ('WARNING', 'WARN') THEN 0.4
+            WHEN s.severity = 'INFO' THEN 0.1
+            ELSE 0.2 END"""
+
+PRIORITY_WEIGHTS = {"burst_count_30m": 0.30, "burst_growth": 0.15, "distinct_affected": 0.20,
+                    "active_days_with_issue": 0.15, "severity_weight": 0.20}
+UNKNOWN_NOT_IN_LOGS = ["financial_cost", "customer_impact", "total_downtime", "sla_penalties"]
+
+
+def _periods(eb: EvidenceBuilder, dataset: str, start: Optional[datetime],
+             end: Optional[datetime]) -> dict[str, datetime]:
+    """Resolves the counting window and the current/previous comparison periods.
+
+    Explicit window: current = window, previous = the equally long window just before it.
+    No window: counts cover the whole corpus; current/previous = second/first half of its span."""
+    if start is None or end is None:
+        bounds = eb.query(f"{dataset} time span", f"SELECT MIN(event_time) AS lo, MAX(event_time) AS hi "
+                                                   f"FROM {DATASET_TABLES[dataset]}")[0]
+        lo, hi = datetime.fromisoformat(bounds["lo"]), datetime.fromisoformat(bounds["hi"])
+    if start is None and end is None:
+        mid = lo + (hi - lo) / 2
+        return {"window_start": lo, "window_end": hi, "current_start": mid, "current_end": hi,
+                "previous_start": lo, "previous_end": mid, "scan_start": lo}
+    w_start, w_end = start or lo, end or hi
+    length = w_end - w_start
+    return {"window_start": w_start, "window_end": w_end, "current_start": w_start, "current_end": w_end,
+            "previous_start": w_start - length, "previous_end": w_start, "scan_start": w_start - length}
+
+
+def _burst_aggregation_sql(dataset: str, p: dict[str, datetime], errors_only: bool) -> tuple[str, list[Any]]:
+    """Per component x severity: counts, distinct entities, 30-minute burst clusters (LAG),
+    the noisiest node's share, and bursts in the current vs previous period. No ORDER BY,
+    so callers can wrap it."""
+    table = DATASET_TABLES[dataset]
+    entity = "l.node_id" if dataset == "BGL" else "l.instance_id"
+    extra_cols = "" if dataset == "BGL" else ", l.request_id, l.instance_id"
+    extra_aggs = ("" if dataset == "BGL" else
+                  "COUNT(DISTINCT request_id) FILTER (WHERE in_window) AS distinct_requests,\n"
+                  "COUNT(DISTINCT instance_id) FILTER (WHERE in_window) AS distinct_instances,\n")
+    error_filter = f"AND {ERROR_FILTER[dataset][0]}" if errors_only else ""
+    sql = f"""
+        WITH base AS (
+            SELECT l.component, l.severity, {entity} AS entity, l.event_time, l.is_anomaly {extra_cols}
+            FROM {table} l
+            WHERE l.event_time >= %s::TIMESTAMP AND l.event_time <= %s::TIMESTAMP {error_filter}
+        ), marked AS (
+            SELECT *,
+                   CASE WHEN prev_time IS NULL OR epoch(event_time) - epoch(prev_time) > {BURST_GAP_SEC}
+                        THEN 1 ELSE 0 END AS burst_start,
+                   event_time >= %s::TIMESTAMP AS in_window,
+                   event_time >= %s::TIMESTAMP AND event_time <= %s::TIMESTAMP AS in_current,
+                   event_time >= %s::TIMESTAMP AND event_time < %s::TIMESTAMP AS in_previous
+            FROM (SELECT *, LAG(event_time) OVER (PARTITION BY component, severity ORDER BY event_time) AS prev_time
+                  FROM base) lagged
+        ), agg AS (
+            SELECT component, severity,
+                   COUNT(*) FILTER (WHERE in_window) AS matching_log_entries,
+                   COUNT(DISTINCT entity) FILTER (WHERE in_window) AS distinct_affected_nodes,
+                   {extra_aggs}
+                   COUNT(*) FILTER (WHERE in_window AND is_anomaly) AS labelled_anomaly_lines,
+                   COUNT(DISTINCT CAST(event_time AS DATE)) FILTER (WHERE in_window) AS active_days_with_issue,
+                   MIN(event_time) FILTER (WHERE in_window) AS first_seen,
+                   MAX(event_time) FILTER (WHERE in_window) AS last_seen,
+                   CAST(COALESCE(SUM(burst_start) FILTER (WHERE in_window), 0) AS BIGINT) AS burst_count_30m,
+                   CAST(COALESCE(SUM(burst_start) FILTER (WHERE in_current), 0) AS BIGINT) AS current_period_bursts,
+                   CAST(COALESCE(SUM(burst_start) FILTER (WHERE in_previous), 0) AS BIGINT) AS previous_period_bursts
+            FROM marked GROUP BY component, severity
+        ), node_counts AS (
+            SELECT component, severity, entity, COUNT(*) AS n,
+                   ROW_NUMBER() OVER (PARTITION BY component, severity ORDER BY COUNT(*) DESC, entity) AS rk
+            FROM marked WHERE in_window AND entity IS NOT NULL
+            GROUP BY component, severity, entity
+        )
         SELECT COALESCE(o.team_name, 'Unassigned') AS team_name,
                COALESCE(o.escalation_tier, 'Unassigned') AS escalation_tier,
-               l.component,
-               l.severity,
-               COUNT(*) AS matching_log_entries,
-               {entity}
-               COUNT(*) FILTER (WHERE l.is_anomaly) AS labelled_anomaly_lines,
-               COUNT(DISTINCT CAST(l.event_time AS DATE)) AS active_days_with_issue,
-               MIN(l.event_time) AS first_seen,
-               MAX(l.event_time) AS last_seen
-        FROM {DATASET_TABLES[dataset]} l
-        LEFT JOIN team_ownership o ON o.dataset = '{dataset}' AND o.component = l.component
-        {where.sql()}
-        GROUP BY 1, 2, 3, 4
-        ORDER BY matching_log_entries DESC
+               a.*,
+               t.entity AS top_node,
+               ROUND(100.0 * t.n / a.matching_log_entries, 2) AS top_node_share_pct,
+               CASE WHEN a.previous_period_bursts > 0
+                    THEN ROUND(100.0 * (a.current_period_bursts - a.previous_period_bursts) / a.previous_period_bursts, 1)
+               END AS growth_pct
+        FROM agg a
+        LEFT JOIN node_counts t ON t.component IS NOT DISTINCT FROM a.component
+                               AND t.severity IS NOT DISTINCT FROM a.severity AND t.rk = 1
+        LEFT JOIN team_ownership o ON o.dataset = '{dataset}' AND o.component = a.component
+        WHERE a.matching_log_entries > 0
     """
+    params = [_ts(p["scan_start"]), _ts(p["window_end"]), _ts(p["window_start"]),
+              _ts(p["current_start"]), _ts(p["current_end"]), _ts(p["previous_start"]), _ts(p["previous_end"])]
+    return sql, params
+
+
+def _period_scope(p: dict[str, datetime]) -> dict[str, str]:
+    return {k: v.isoformat() for k, v in p.items() if k != "scan_start"}
+
+
+AGGREGATION_NOTES = [
+    "matching_log_entries counts log lines, not incidents: one faulty node can emit thousands of lines. "
+    "burst_count_30m counts bursts (lines on the same component and severity less than 30 minutes apart "
+    "form one burst); top_node_share_pct near 100 means a single-node fault, low values a widespread one.",
+    "For OpenStack, distinct_affected_nodes and top_node refer to VM instances (instance_id).",
+    "current_period_bursts vs previous_period_bursts: an explicit window is compared with the equally long "
+    "window before it; without a window, the second half of the corpus span is compared with the first. "
+    "growth_pct is null when the previous period had no bursts.",
+    "BGL and OpenStack are separate systems with different logging volumes; compare within a dataset, not across.",
+]
 
 
 def summarize_by_team_and_component(dataset: Literal["BGL", "OpenStack", "BOTH"] = "BOTH",
@@ -387,22 +478,27 @@ def summarize_by_team_and_component(dataset: Literal["BGL", "OpenStack", "BOTH"]
                                     errors_only: bool = True, limit: int = 50) -> dict[str, Any]:
     datasets = list(DATASET_TABLES) if dataset == "BOTH" else [_dataset(dataset)]
     start, end = _parse_time(start_time, "start_time"), _parse_time(end_time, "end_time")
+    if start and end and end <= start:
+        raise ValueError("end_time must be after start_time")
     limit = _clamp(limit, 1, MAX_AGG_ROWS)
 
     with EvidenceBuilder("summarize_by_team_and_component") as eb:
         all_rows: list[dict[str, Any]] = []
         scopes = []
         for ds in datasets:
-            where, applied = _common_filters(ds, start, end, errors_only=errors_only)
-            rows = eb.query(f"{ds} team/component aggregation", _team_component_sql(ds, where), where.params)
+            periods = _periods(eb, ds, start, end)
+            sql, params = _burst_aggregation_sql(ds, periods, errors_only)
+            rows = eb.query(f"{ds} team/component aggregation with 30-min bursts and top-node share",
+                            sql + "\nORDER BY matching_log_entries DESC, component, severity", params)
             all_rows += [{"dataset": ds, **r} for r in rows]
-            scopes.append(_scope(eb, ds, start, end, applied))
+            applied = {"errors_only": ERROR_FILTER[ds][1]} if errors_only else {}
+            scopes.append({**_scope(eb, ds, start, end, applied), "periods": _period_scope(periods)})
 
         by_team: dict[str, int] = {}
         for r in all_rows:
             key = f"{r['dataset']}: {r['team_name']}"
             by_team[key] = by_team.get(key, 0) + r["matching_log_entries"]
-        all_rows.sort(key=lambda r: r["matching_log_entries"], reverse=True)
+        all_rows.sort(key=lambda r: (-r["matching_log_entries"], r["dataset"], str(r["component"]), str(r["severity"])))
 
         return eb.envelope(
             data_scope={"datasets": scopes},
@@ -414,11 +510,156 @@ def summarize_by_team_and_component(dataset: Literal["BGL", "OpenStack", "BOTH"]
             summary={
                 "groups": len(all_rows),
                 "matching_log_entries_by_team": dict(sorted(by_team.items(), key=lambda kv: -kv[1])),
+                "bursts_by_team": _sum_by_team(all_rows, "burst_count_30m"),
             },
-            notes=["matching_log_entries counts log lines, not incidents: one faulty node can emit thousands of "
-                   "lines. Compare with distinct_affected_nodes / distinct_instances and active_days_with_issue.",
-                   "BGL and OpenStack are separate systems with different logging volumes; compare within a "
-                   "dataset, not across."],
+            notes=AGGREGATION_NOTES,
+        )
+
+
+def _sum_by_team(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in rows:
+        key = f"{r['dataset']}: {r['team_name']}"
+        out[key] = out.get(key, 0) + int(r[field] or 0)
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+def get_priority_ranking(dataset: Literal["BGL", "OpenStack", "BOTH"] = "BOTH", start_time: Optional[str] = None,
+                         end_time: Optional[str] = None, limit: int = 15) -> dict[str, Any]:
+    """Deterministic 0-100 priority score per component x severity (errors and alerts only):
+    weighted percentile ranks of bursts, burst growth, breadth, persistence and severity."""
+    datasets = list(DATASET_TABLES) if dataset == "BOTH" else [_dataset(dataset)]
+    start, end = _parse_time(start_time, "start_time"), _parse_time(end_time, "end_time")
+    if start and end and end <= start:
+        raise ValueError("end_time must be after start_time")
+    limit = _clamp(limit, 1, MAX_AGG_ROWS)
+    w = PRIORITY_WEIGHTS
+
+    with EvidenceBuilder("get_priority_ranking") as eb:
+        all_rows: list[dict[str, Any]] = []
+        scopes = []
+        for ds in datasets:
+            periods = _periods(eb, ds, start, end)
+            agg_sql, params = _burst_aggregation_sql(ds, periods, errors_only=True)
+            sql = f"""
+                SELECT r.*,
+                       ROUND(100.0 * ({w['burst_count_30m']} * r.pct_bursts + {w['burst_growth']} * r.pct_growth
+                                      + {w['distinct_affected']} * r.pct_breadth + {w['active_days_with_issue']} * r.pct_days
+                                      + {w['severity_weight']} * r.severity_weight), 1) AS priority_score
+                FROM (
+                    SELECT s.team_name, s.escalation_tier, s.component, s.severity,
+                           s.matching_log_entries, s.burst_count_30m, s.current_period_bursts,
+                           s.previous_period_bursts, s.growth_pct, s.distinct_affected_nodes,
+                           s.active_days_with_issue, s.top_node, s.top_node_share_pct,
+                           {SEVERITY_WEIGHT_SQL} AS severity_weight,
+                           ROUND(PERCENT_RANK() OVER (ORDER BY s.burst_count_30m), 4) AS pct_bursts,
+                           ROUND(PERCENT_RANK() OVER (ORDER BY (s.current_period_bursts - s.previous_period_bursts)
+                                                      * 1.0 / GREATEST(s.previous_period_bursts, 1)), 4) AS pct_growth,
+                           ROUND(PERCENT_RANK() OVER (ORDER BY s.distinct_affected_nodes), 4) AS pct_breadth,
+                           ROUND(PERCENT_RANK() OVER (ORDER BY s.active_days_with_issue), 4) AS pct_days
+                    FROM ({agg_sql}) s
+                ) r
+                ORDER BY priority_score DESC, r.burst_count_30m DESC, r.component, r.severity
+            """
+            rows = eb.query(f"{ds} weighted percentile priority score", sql, params)
+            all_rows += [{"dataset": ds, **r} for r in rows]
+            scopes.append({**_scope(eb, ds, start, end, {"errors_only": ERROR_FILTER[ds][1]}),
+                           "periods": _period_scope(periods)})
+
+        all_rows.sort(key=lambda r: (-r["priority_score"], -r["burst_count_30m"], r["dataset"],
+                                     str(r["component"]), str(r["severity"])))
+        for rank, r in enumerate(all_rows, 1):
+            r["rank"] = rank
+        return eb.envelope(
+            data_scope={"datasets": scopes},
+            rows=all_rows[:limit],
+            total_matching_count=len(all_rows),
+            is_truncated=len(all_rows) > limit,
+            truncation_notice=f"Showing top {limit} of {len(all_rows)} ranked groups." if len(all_rows) > limit else None,
+            summary={
+                "weights": w,
+                "formula": "priority_score = 100 * sum(weight_i * percentile_rank_i), percentile ranks computed "
+                           "within each dataset with PERCENT_RANK(); severity_weight FATAL/FAILURE/CRITICAL 1.0, "
+                           "SEVERE 0.9, ERROR 0.8, WARNING 0.4, INFO (labelled alerts) 0.1",
+                "burst_growth_metric": "(current_period_bursts - previous_period_bursts) / max(previous_period_bursts, 1)",
+            },
+            notes=AGGREGATION_NOTES[:3] + [
+                "The score ranks only what the logs measure. Business impact is not in the logs: see unknown_not_in_logs."],
+            extra={"unknown_not_in_logs": UNKNOWN_NOT_IN_LOGS},
+        )
+
+
+def get_latency_outliers(start_time: Optional[str] = None, end_time: Optional[str] = None, k: float = 6.0,
+                         min_excess_sec: float = 2.0, limit: int = 25, min_samples: int = 20) -> dict[str, Any]:
+    """OpenStack operations slower than max(median + k*MAD, median + min_excess_sec) of their own
+    pattern (component x operation), with baselines computed over the whole corpus."""
+    start, end = _parse_time(start_time, "start_time"), _parse_time(end_time, "end_time")
+    k = float(max(1.0, min(float(k), 50.0)))
+    min_excess_sec = float(max(0.0, min(float(min_excess_sec), 600.0)))
+    limit = _clamp(limit, 1, MAX_SEARCH_LIMIT)
+    min_samples = _clamp(min_samples, 5, 10_000)
+    where, applied = _common_filters("OpenStack", start, end)
+    window = ("AND " + " AND ".join(where.parts)) if where.parts else ""
+
+    baseline = """
+        WITH stats AS (
+            SELECT component, operation, COUNT(*) AS samples, median(duration_sec) AS median_sec
+            FROM openstack_logs WHERE duration_sec IS NOT NULL
+            GROUP BY component, operation HAVING COUNT(*) >= %s
+        ), mad AS (
+            SELECT l.component, l.operation, median(abs(l.duration_sec - s.median_sec)) AS mad_sec
+            FROM openstack_logs l JOIN stats s ON s.component = l.component AND s.operation = l.operation
+            WHERE l.duration_sec IS NOT NULL
+            GROUP BY l.component, l.operation
+        ), thresholds AS (
+            SELECT s.component, s.operation, s.samples, s.median_sec, m.mad_sec,
+                   GREATEST(s.median_sec + %s * m.mad_sec, s.median_sec + %s) AS threshold_sec
+            FROM stats s JOIN mad m ON m.component = s.component AND m.operation = s.operation
+        )"""
+    base_params = [min_samples, k, min_excess_sec]
+    hits_sql = f"""{baseline}
+        SELECT l.line_id, l.event_time, l.component, l.operation, l.severity, l.request_id, l.instance_id,
+               ROUND(l.duration_sec, 4) AS duration_sec, ROUND(t.median_sec, 4) AS baseline_median_sec,
+               ROUND(t.mad_sec, 4) AS baseline_mad_sec, ROUND(t.threshold_sec, 4) AS threshold_sec,
+               ROUND(l.duration_sec / NULLIF(t.median_sec, 0), 2) AS ratio_to_median,
+               l.severity = 'INFO' AS silent_info_level, l.message,
+               COUNT(*) OVER () AS total_matching_count
+        FROM openstack_logs l JOIN thresholds t ON t.component = l.component AND t.operation = l.operation
+        WHERE l.duration_sec > t.threshold_sec {window}
+        ORDER BY ratio_to_median DESC NULLS LAST, l.line_id
+        LIMIT %s
+    """
+    patterns_sql = f"""{baseline}
+        SELECT t.component, t.operation, t.samples, ROUND(t.median_sec, 4) AS median_sec,
+               ROUND(t.mad_sec, 4) AS mad_sec, ROUND(t.threshold_sec, 4) AS threshold_sec,
+               COUNT(l.line_id) AS outliers, ROUND(MAX(l.duration_sec), 4) AS worst_sec
+        FROM thresholds t
+        LEFT JOIN openstack_logs l ON l.component = t.component AND l.operation = t.operation
+                                  AND l.duration_sec > t.threshold_sec {window}
+        GROUP BY 1, 2, 3, 4, 5, 6
+        ORDER BY outliers DESC, t.component, t.operation
+        LIMIT 30
+    """
+    with EvidenceBuilder("get_latency_outliers") as eb:
+        rows = eb.query("MAD outliers per component x operation", hits_sql, base_params + where.params + [limit])
+        total = int(rows[0]["total_matching_count"]) if rows else 0
+        for r in rows:
+            r.pop("total_matching_count")
+        patterns = eb.query("per-pattern baseline and outlier counts", patterns_sql, base_params + where.params)
+        return eb.envelope(
+            data_scope=_scope(eb, "OpenStack", start, end, {**applied, "k": k, "min_excess_sec": min_excess_sec,
+                                                            "min_samples": min_samples}),
+            rows=rows,
+            total_matching_count=total,
+            is_truncated=total > len(rows),
+            truncation_notice=f"Showing the {len(rows)} most extreme of {total:,} outliers." if total > len(rows) else None,
+            summary={"rule": "duration_sec > max(median + k * MAD, median + min_excess_sec) per component x operation; "
+                             "baseline over the whole corpus",
+                     "patterns": patterns,
+                     "silent_info_outliers_in_sample": sum(1 for r in rows if r["silent_info_level"])},
+            notes=["duration_sec is the HTTP latency for nova-api requests and X in 'Took X seconds to <operation>' "
+                   "for nova-compute (spawn, build, deallocate, destroy).",
+                   "silent_info_level marks outliers logged at INFO: no error was raised for them."],
         )
 
 

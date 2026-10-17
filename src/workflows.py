@@ -22,13 +22,14 @@ def _team_lead() -> list[tuple[str, dict[str, Any]]]:
         ("summarize_by_team_and_component", {"dataset": "BOTH", "errors_only": True, "limit": 25}),
         ("get_recurring_trends", {"dataset": "BGL", "bucket_size": "week", "errors_only": True}),
         ("get_recurring_trends", {"dataset": "OpenStack", "bucket_size": "day", "errors_only": True}),
+        ("get_latency_outliers", {"limit": 15}),
     ]
 
 
 def _manager() -> list[tuple[str, dict[str, Any]]]:
     return [
         ("get_corpus_scope", {}),
-        ("summarize_by_team_and_component", {"dataset": "BOTH", "errors_only": True, "limit": 15}),
+        ("get_priority_ranking", {"dataset": "BOTH", "limit": 10}),
         ("get_openstack_latency_and_errors", {}),
     ]
 
@@ -41,14 +42,23 @@ PLANS: dict[Role, Callable[[], list[tuple[str, dict[str, Any]]]]] = {
 
 
 def baseline_evidence(role: Role) -> list[dict[str, Any]]:
-    """Runs the role's fixed tool sequence; the Engineer plan follows up on the first hit."""
+    """Runs the role's fixed tool sequence; the Engineer plan follows up on the first hit.
+    Evidence IDs are renumbered per run (EV-01, EV-02, ...) as in the agent."""
     results = []
-    for name, args in PLANS[role]():
+
+    def run(name: str, args: dict[str, Any]) -> Any:
         envelope, error = call_tool(name, args)
-        results.append({"name": name, "arguments": args, "envelope": envelope, "error": error})
+        evidence_id = None
+        if envelope is not None:
+            evidence_id = f"EV-{sum(1 for r in results if r['envelope']) + 1:02d}"
+            envelope = {**envelope, "evidence_id": evidence_id}
+        results.append({"evidence_id": evidence_id, "name": name, "arguments": args, "envelope": envelope,
+                        "error": error})
+        return envelope
+
+    for name, args in PLANS[role]():
+        envelope = run(name, args)
         if role == Role.ENGINEER and name == "search_logs" and envelope and envelope["rows"]:
-            follow = {"dataset": "BGL", "anchor_line_id": envelope["rows"][0]["line_id"],
-                      "window_lines": 10, "same_entity_only": True}
-            env2, err2 = call_tool("get_nearby_events", follow)
-            results.append({"name": "get_nearby_events", "arguments": follow, "envelope": env2, "error": err2})
+            run("get_nearby_events", {"dataset": "BGL", "anchor_line_id": envelope["rows"][0]["line_id"],
+                                      "window_lines": 10, "same_entity_only": True})
     return results

@@ -22,8 +22,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from src.mcp_server import mcp
-from src.prompts import Role, system_prompt
-from src.validator import ValidationReport, validate_answer
+from src.prompts import Role, missing_sections, system_prompt
+from src.claim_verifier import ClaimReport, index_evidence, verify_response_claims
 
 load_dotenv()
 
@@ -31,6 +31,7 @@ MAX_TOOL_ROUNDS = 8
 
 
 class ToolCallRecord(BaseModel):
+    evidence_id: Optional[str] = None
     name: str
     arguments: dict[str, Any]
     envelope: Optional[dict[str, Any]] = None
@@ -44,7 +45,9 @@ class AgentResult(BaseModel):
     model: str
     answer: str
     tool_calls: list[ToolCallRecord]
-    validation: ValidationReport
+    validation: ClaimReport
+    missing_sections: list[str] = []
+    evidence_ledger: dict[str, dict[str, Any]]
     revised_after_validation: bool
     usage: dict[str, int]
 
@@ -101,6 +104,7 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
         {"role": "user", "content": question},
     ]
     records: list[ToolCallRecord] = []
+    ledger: dict[str, dict[str, Any]] = {}
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
     def complete(tool_choice: str) -> Any:
@@ -134,8 +138,15 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
                 t0 = time.perf_counter()
                 envelope, error = call_tool(tc.function.name, args)
                 elapsed = (time.perf_counter() - t0) * 1000
-            record = ToolCallRecord(name=tc.function.name, arguments=args, envelope=envelope,
-                                    error=error, duration_ms=round(elapsed, 1))
+            evidence_id = None
+            if envelope is not None:
+                # Evidence IDs are numbered per question so answers cite EV-01, EV-02, ...
+                evidence_id = f"EV-{len(ledger) + 1:02d}"
+                envelope = {"evidence_id": evidence_id, **{k: v for k, v in envelope.items() if k != "evidence_id"}}
+                ledger[evidence_id] = envelope
+                index_evidence(evidence_id, envelope)
+            record = ToolCallRecord(evidence_id=evidence_id, name=tc.function.name, arguments=args,
+                                    envelope=envelope, error=error, duration_ms=round(elapsed, 1))
             records.append(record)
             emit("tool_result", record.model_dump())
             messages.append({
@@ -145,20 +156,33 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
             })
 
     _drop_workspace_indexes_created(records)
-    envelopes = [r.envelope for r in records if r.envelope]
-    report = validate_answer(role, answer, envelopes)
+    report = verify_response_claims(answer, ledger, role.value)
+    missing = missing_sections(role, answer)
     revised = False
-    if not report.passed:
-        emit("revising", report.model_dump())
+    # Without any evidence (e.g. every tool failed) there are no figures to ask for.
+    if not report.passed or (report.no_numeric_claims and ledger) or missing:
+        emit("revising", {**report.model_dump(exclude={"checks", "cleaned_text"}), "missing_sections": missing})
+        problems = [report.feedback()] if not report.passed else []
+        if missing:
+            problems.append("Your answer is missing these required sections: " + "; ".join(missing) + ".")
+        if report.no_numeric_claims and ledger:
+            problems.append("State the key measured figures (counts, bursts, nodes, scores) from the evidence, "
+                            "each with its [EV-XX].")
         messages.append({"role": "assistant", "content": answer})
-        messages.append({"role": "user", "content": "Revise your answer. " + report.feedback()
-                         + " Keep the same sections. Do not call tools."})
+        messages.append({"role": "user", "content": "Revise your answer. " + " ".join(problems)
+                         + " Use exactly the required sections and keep the [EV-XX] citations. Do not call tools."})
         answer = complete("none").content or answer
-        report = validate_answer(role, answer, envelopes)
+        report = verify_response_claims(answer, ledger, role.value)
+        missing = missing_sections(role, answer)
         revised = True
+    if role == Role.MANAGER and report.forbidden_claims:
+        # Last resort: unsupported business-impact sentences are removed, not shown.
+        report = verify_response_claims(answer, ledger, role.value, mode="strip")
+        answer = report.cleaned_text
 
     return AgentResult(role=role, question=question, model=model, answer=answer, tool_calls=records,
-                       validation=report, revised_after_validation=revised, usage=usage)
+                       validation=report, missing_sections=missing, evidence_ledger=ledger,
+                       revised_after_validation=revised, usage=usage)
 
 
 def _drop_workspace_indexes_created(records: list[ToolCallRecord]) -> None:

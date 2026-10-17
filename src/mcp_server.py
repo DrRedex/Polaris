@@ -13,6 +13,8 @@ Register with Claude Code:
 """
 
 import argparse
+import functools
+import itertools
 import os
 import threading
 from typing import Annotated, Any, Literal, Optional
@@ -42,6 +44,9 @@ Typical flows:
 - Team Lead: summarize_by_team_and_component -> get_recurring_trends -> search_logs(limit=5) for the template.
 - Manager: get_corpus_scope -> summarize_by_team_and_component(BOTH) -> get_recurring_trends ->
   get_openstack_latency_and_errors.
+- Manager: get_priority_ranking gives a deterministic 0-100 score per component and severity.
+- Engineer / Team Lead on OpenStack: get_latency_outliers finds slow operations (incl. silent INFO-level VM spawns).
+- Every result carries an evidence_id (EV-XX); cite it after each factual sentence, e.g. [EV-02].
 - Deep dive on one time window: manage_workspace_index(create or benchmark) first, drop when done.
 - query_remote_otel_parquet works on a separate 50B-row OpenTelemetry benchmark on S3, not on BGL/OpenStack.
 - Vague question that no tool fits: resolve_semantic_schema first (it usually names the right tool);
@@ -56,12 +61,34 @@ READ_ONLY = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_worl
 WORKSPACE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 REMOTE = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=True)
 
+_evidence_counter = itertools.count(1)
+_evidence_lock = threading.Lock()
+
+
+def next_evidence_id() -> str:
+    with _evidence_lock:
+        return f"EV-{next(_evidence_counter):02d}"
+
+
+def evidence(fn):
+    """Stamps each tool result with a unique evidence_id so answers can cite [EV-XX].
+    functools.wraps keeps the signature and annotations the MCP schema is built from."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if isinstance(result, dict):
+            result = {"evidence_id": next_evidence_id(), **{k: v for k, v in result.items() if k != "evidence_id"}}
+        return result
+    return wrapper
+
+
 DatasetArg = Annotated[Literal["BGL", "OpenStack"], Field(description="Which log corpus to query")]
 StartArg = Annotated[Optional[str], Field(description="Inclusive lower bound, ISO-8601 (e.g. 2005-06-03T00:00:00). Omit for corpus start")]
 EndArg = Annotated[Optional[str], Field(description="Inclusive upper bound, ISO-8601. Omit for corpus end")]
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def get_corpus_scope() -> dict[str, Any]:
     """Row counts, time span, component count and severity distribution for both datasets.
 
@@ -72,6 +99,7 @@ def get_corpus_scope() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def search_logs(
     dataset: DatasetArg,
     query_text: Annotated[str, Field(description="Words or phrase to find in log messages, e.g. 'machine check' or 'InstanceNotFound'")],
@@ -96,6 +124,7 @@ def search_logs(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def get_nearby_events(
     dataset: DatasetArg,
     anchor_line_id: Annotated[int, Field(description="line_id of the event to centre on, taken from search_logs results")],
@@ -115,6 +144,7 @@ def get_nearby_events(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def summarize_by_team_and_component(
     dataset: Annotated[Literal["BGL", "OpenStack", "BOTH"], Field(description="Corpus to aggregate, or BOTH")] = "BOTH",
     start_time: StartArg = None,
@@ -133,6 +163,7 @@ def summarize_by_team_and_component(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def get_recurring_trends(
     dataset: DatasetArg,
     bucket_size: Annotated[Literal["hour", "day", "week"], Field(description="Time bucket; hour requires a window of at most 31 days")] = "week",
@@ -152,6 +183,7 @@ def get_recurring_trends(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def get_openstack_latency_and_errors(
     start_time: StartArg = None,
     end_time: EndArg = None,
@@ -167,7 +199,45 @@ def get_openstack_latency_and_errors(
     return queries.get_openstack_latency_and_errors(start_time, end_time, component, breakdown)
 
 
+@mcp.tool(annotations=READ_ONLY)
+@evidence
+def get_priority_ranking(
+    dataset: Annotated[Literal["BGL", "OpenStack", "BOTH"], Field(description="Corpus to rank, or BOTH")] = "BOTH",
+    start_time: StartArg = None,
+    end_time: EndArg = None,
+    limit: Annotated[int, Field(ge=1, le=100, description="Ranked groups to return")] = 15,
+) -> dict[str, Any]:
+    """Deterministic 0-100 priority score per component x severity (Manager, Team Lead).
+
+    priority_score = 100 x weighted percentile ranks (within each dataset) of: 30-minute burst
+    count (0.30), burst growth vs the previous period (0.15), distinct affected nodes/instances
+    (0.20), active days (0.15) and a severity weight (0.20; FATAL 1.0, ERROR 0.8, WARNING 0.4).
+    Every factor is returned per row. unknown_not_in_logs lists impacts the logs cannot measure.
+    """
+    return queries.get_priority_ranking(dataset, start_time, end_time, limit)
+
+
+@mcp.tool(annotations=READ_ONLY)
+@evidence
+def get_latency_outliers(
+    start_time: StartArg = None,
+    end_time: EndArg = None,
+    k: Annotated[float, Field(ge=1.0, le=50.0, description="MAD multiplier")] = 6.0,
+    min_excess_sec: Annotated[float, Field(ge=0.0, le=600.0, description="Minimum seconds above the median")] = 2.0,
+    limit: Annotated[int, Field(ge=1, le=100, description="Outlier rows to return")] = 25,
+) -> dict[str, Any]:
+    """OpenStack operations far slower than their own normal (Engineer, Team Lead).
+
+    For each component x operation (HTTP route, or nova-compute 'spawn/build/destroy/deallocate'
+    timings), computes the median and median absolute deviation (MAD) of duration_sec over the
+    whole corpus and returns calls above max(median + k*MAD, median + min_excess_sec), with
+    ratio_to_median, request_id / instance_id and whether they were logged silently at INFO.
+    """
+    return queries.get_latency_outliers(start_time, end_time, k, min_excess_sec, limit)
+
+
 @mcp.tool(annotations=WORKSPACE)
+@evidence
 def manage_workspace_index(
     action: Annotated[Literal["create", "benchmark", "drop", "list"], Field(
         description="create: build a partial full-text index over the window. benchmark: compare search speed "
@@ -188,6 +258,7 @@ def manage_workspace_index(
 
 
 @mcp.tool(annotations=REMOTE)
+@evidence
 def query_remote_otel_parquet(
     action: Annotated[Literal["overview", "service_summary", "search_body"], Field(
         description="overview: row counts and time ranges per file from Parquet footers. service_summary: log "
@@ -212,6 +283,7 @@ def query_remote_otel_parquet(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def resolve_semantic_schema(
     user_query: Annotated[str, Field(description="The question in plain language, e.g. 'customers say the API is slow'")],
     k: Annotated[int, Field(ge=1, le=10, description="Number of semantic (KNN) column matches")] = 4,
@@ -227,6 +299,7 @@ def resolve_semantic_schema(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@evidence
 def execute_guarded_readonly_sql(
     user_query: Annotated[str, Field(description="The question the SQL answers (used for schema grounding)")],
     candidate_sql: Annotated[str, Field(description="One read-only SELECT over bgl_logs, openstack_logs, team_ownership "

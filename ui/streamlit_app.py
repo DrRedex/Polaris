@@ -45,6 +45,8 @@ def render_knn(matches: list[dict]) -> None:
 
 
 def render_envelope(env: dict) -> None:
+    if env.get("unknown_not_in_logs"):
+        st.warning("Not measurable from these logs: " + ", ".join(env["unknown_not_in_logs"]))
     if env.get("knn_schema_matches"):
         render_knn(env["knn_schema_matches"])
     if env.get("executed_sql"):
@@ -72,10 +74,36 @@ def render_envelope(env: dict) -> None:
         st.caption(f"ℹ️ {note}")
 
 
+def render_claims(v, revised: bool) -> None:
+    """Deterministic claim verification: every number checked against the evidence it cites."""
+    cols = st.columns(4)
+    cols[0].metric("Verified numbers", f"{v.verified_number_rate:.0%}", f"{v.numbers_verified}/{v.numbers_checked}",
+                   delta_color="off")
+    cols[1].metric("Cited sentences", f"{v.cited_sentences}/{v.sentences_checked}")
+    cols[2].metric("Uncited numeric", v.uncited_numeric_sentences)
+    cols[3].metric("Verifier time", f"{v.elapsed_ms:.1f} ms")
+    if v.no_numeric_claims:
+        st.info("No numeric claims to verify in this answer.")
+    elif v.passed:
+        st.success("Claim check passed: every number is in the evidence it cites"
+                   + (" (after one revision)" if revised else ""))
+    else:
+        st.warning("Claim check found issues" + (" after one revision" if revised else ""))
+    if v.stripped_sentences:
+        st.error("Removed unsupported business-impact sentences: " + " | ".join(v.stripped_sentences))
+    elif v.forbidden_claims:
+        st.error("Business-impact claims not supported by the logs: " + " | ".join(v.forbidden_claims))
+    bad = [c for c in v.checks if not c.verified]
+    if bad:
+        st.dataframe(pd.DataFrame([{"number": c.number, "reason": c.reason, "cited": ", ".join(c.cited),
+                                    "sentence": c.sentence} for c in bad]), width="stretch", hide_index=True)
+
+
 def render_tool_calls(calls: list[dict]) -> None:
     st.subheader(f"Executed SQL & evidence ({len(calls)} tool calls)")
     for i, call in enumerate(calls, 1):
-        label = f"{i}. {call['name']}({', '.join(f'{k}={v!r}' for k, v in call['arguments'].items())})"
+        badge = f"[{call['evidence_id']}] " if call.get("evidence_id") else ""
+        label = f"{badge}{call['name']}({', '.join(f'{k}={v!r}' for k, v in call['arguments'].items())})"
         with st.expander(label + ("  ⚠️ error" if call.get("error") else "")):
             if call.get("error"):
                 st.error(call["error"])
@@ -87,14 +115,9 @@ def render_entry(entry: dict) -> None:
     st.markdown(f"**{entry['role'].value}** · {entry['question']}")
     if entry["kind"] == "agent":
         result = entry["payload"]
-        v = result.validation
-        if v.passed:
-            st.success(f"Grounding check passed: {v.numbers_checked} figures matched tool results"
-                       + (" (after one revision)" if result.revised_after_validation else ""))
-        else:
-            st.warning("Grounding check found issues: "
-                       + "; ".join(([f"unverified figures {v.unverified_numbers}"] if v.unverified_numbers else [])
-                                   + ([f"business-impact claims {v.forbidden_claims}"] if v.forbidden_claims else [])))
+        render_claims(result.validation, result.revised_after_validation)
+        if result.missing_sections:
+            st.warning("Missing required sections: " + "; ".join(result.missing_sections))
         st.markdown(result.answer)
         st.caption(f"Model {result.model} · {result.usage.get('prompt_tokens', 0):,} prompt / "
                    f"{result.usage.get('completion_tokens', 0):,} completion tokens")

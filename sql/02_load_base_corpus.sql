@@ -14,6 +14,16 @@ CREATE INDEX bgl_logs_idx ON bgl_logs
 CREATE INDEX openstack_logs_idx ON openstack_logs
     USING inverted (line_id, message log_text);
 
--- Publish the freshly loaded rows to the indexes immediately.
+-- Index publish step. Inverted indexes are eventually consistent and compact in the
+-- background, so results right after a bulk load could depend on timing. These make the
+-- post-load state deterministic before any query runs:
+--   REFRESH_TABLE         publish every loaded row to readers
+--   COMPACT_TABLE         merge index segments now instead of in the background
+--   RECOMPUTE_STATS_TABLE recompute the statistics used for scoring and planning
+-- (A bare "VACUUM;" is a documented no-op on SereneDB tables, so it is not used here.)
 VACUUM (REFRESH_TABLE) bgl_logs;
 VACUUM (REFRESH_TABLE) openstack_logs;
+VACUUM (COMPACT_TABLE) bgl_logs;
+VACUUM (COMPACT_TABLE) openstack_logs;
+VACUUM (RECOMPUTE_STATS_TABLE) bgl_logs;
+VACUUM (RECOMPUTE_STATS_TABLE) openstack_logs;

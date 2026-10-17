@@ -82,6 +82,8 @@ class ExecutedQuery(BaseModel):
 
 
 class EvidenceEnvelope(BaseModel):
+    evidence_id: Optional[str] = Field(
+        None, description="Citation handle (EV-01, EV-02, ...) assigned when the result is returned to an agent")
     tool_name: str
     data_scope: dict[str, Any]
     executed_queries: list[ExecutedQuery]

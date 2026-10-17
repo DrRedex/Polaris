@@ -28,6 +28,7 @@ OPENSTACK_COLUMNS = [
     "line_id", "source_file", "log_file", "event_time", "process_id", "severity",
     "component", "logger", "request_id", "user_id", "tenant_id", "instance_id",
     "http_method", "http_path", "http_route", "http_status", "response_bytes", "latency_sec",
+    "operation", "duration_sec",
     "anomaly_label", "is_anomaly", "message",
 ]
 
@@ -41,6 +42,8 @@ HTTP_RE = re.compile(
     r'"(?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(?P<path>\S+)\s+HTTP/[\d.]+"\s+'
     r"status:\s*(?P<status>\d+)\s+len:\s*(?P<len>\d+)\s+time:\s*(?P<time>[\d.]+)"
 )
+# nova-compute timing lines: "Took 21.38 seconds to spawn the instance on the hypervisor."
+TOOK_RE = re.compile(r"Took (?P<sec>\d+(?:\.\d+)?) seconds to (?P<op>[a-z][a-z ]*[a-z])")
 INSTANCE_RE = re.compile(r"\[instance:\s*(?P<id>[0-9a-f\-]{36})\]")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # Tenant IDs (32 hex) and instance UUIDs in URL paths, collapsed so routes group together.
@@ -152,6 +155,7 @@ def parse_openstack(sources: list[Path], dst: Path, anomalous_instances: set[str
                     instance_id = inst["id"] if inst else ""
 
                     http = HTTP_RE.search(content)
+                    took = None if http else TOOK_RE.search(content)
                     is_anomaly = bool(instance_id) and instance_id in anomalous_instances
 
                     writer.writerow([
@@ -173,6 +177,10 @@ def parse_openstack(sources: list[Path], dst: Path, anomalous_instances: set[str
                         http["status"] if http else "",
                         http["len"] if http else "",
                         http["time"] if http else "",
+                        # One duration per timed operation, for per-pattern outlier detection.
+                        f"{http['method']} {PATH_ID_RE.sub('{id}', http['path'].split('?', 1)[0])}" if http
+                        else (took["op"] if took else ""),
+                        http["time"] if http else (took["sec"] if took else ""),
                         "Anomaly" if is_anomaly else "Normal",
                         "true" if is_anomaly else "false",
                         content,

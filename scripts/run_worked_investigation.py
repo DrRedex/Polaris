@@ -64,7 +64,8 @@ def reproduce(envelope: dict) -> tuple[list[str], int]:
 
 
 def md_tool_call(i: int, call: dict) -> list[str]:
-    out = [f"#### {i}. `{call['name']}`", "", f"Arguments: `{json.dumps(call['arguments'])}`", ""]
+    badge = f"[{call['evidence_id']}] " if call.get("evidence_id") else ""
+    out = [f"#### {badge}`{call['name']}`", "", f"Arguments: `{json.dumps(call['arguments'])}`", ""]
     if call.get("error"):
         return out + [f"Error returned to the agent: `{call['error']}`", ""]
     env = call["envelope"]
@@ -118,11 +119,19 @@ def main() -> int:
             result = run_agent(role, question, on_event=lambda k, d: k == "tool_call" and print("  tool:", d["name"]))
             v = result.validation
             failures += 0 if v.passed else 1
-            lines += [f"*Model `{result.model}`. Grounding check: "
-                      f"{'passed' if v.passed else 'FAILED'} ({v.numbers_checked} figures checked"
-                      f"{', revised once' if result.revised_after_validation else ''}).*", ""]
+            lines += [f"*Model `{result.model}`. Claim check: {'passed' if v.passed else 'FAILED'}: "
+                      f"verified_number_rate {v.verified_number_rate:.2%} ({v.numbers_verified}/{v.numbers_checked} "
+                      f"numbers in their cited evidence), {v.cited_sentences}/{v.sentences_checked} sentences cited, "
+                      f"verifier {v.elapsed_ms:.1f} ms{', revised once' if result.revised_after_validation else ''}.*", ""]
             if not v.passed:
-                lines += [f"> Unverified figures: {v.unverified_numbers}; business-impact claims: {v.forbidden_claims}", ""]
+                bad = [f"{c.number} ({c.reason}, cited {c.cited})" for c in v.checks if not c.verified]
+                lines += [f"> Unverified: {bad}; business-impact claims: {v.forbidden_claims}", ""]
+            if result.missing_sections:
+                lines += [f"> Missing required sections: {result.missing_sections}", ""]
+            if v.no_numeric_claims:
+                lines += ["> The answer contains no numeric claims to verify.", ""]
+            if v.stripped_sentences:
+                lines += [f"> Removed unsupported sentences: {v.stripped_sentences}", ""]
             lines += ["### Answer", "", result.answer, ""]
             calls = [c.model_dump() for c in result.tool_calls]
         lines += ["### Evidence", ""]

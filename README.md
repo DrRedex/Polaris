@@ -23,7 +23,7 @@ Millions of log lines don't fit in an LLM context window, so the work is split:
  └───────────────────────────────────────────┬──────────────────────────────────────────────┘
                                              │
  ┌──────────────── MCP server (src/mcp_server.py, stdio / SSE / streamable HTTP) ────────────┐
- │ 10 typed, bounded tools                                                                    │
+ │ 12 typed, bounded tools                                                                    │
  └───────────────┬───────────────────────────────────────────────┬──────────────────────────┘
                  │                                               │
      Claude Code / Claude Desktop                 OpenAI agent (src/agent.py) + grounding validator
@@ -87,7 +87,9 @@ The server's instructions tell the client the evidence rules and the per-role to
 | `get_corpus_scope` | Manager | Rows, time span, severity distribution per dataset | – |
 | `search_logs` | Engineer | Full-text search (`all_terms`, `any_terms`, `phrase` via the inverted index; `substring` scan) with time, component (case-insensitive) and severity filters; ISO times with an offset are converted to UTC. Returns the exact `total_matching_count` plus the earliest matches | `limit` 1–100 |
 | `get_nearby_events` | Engineer | Events before and after an anchor line: on the same node (BGL) or instance/request (OpenStack) ordered by time, or physically adjacent lines | 1–50 each side, ≤7 days |
-| `summarize_by_team_and_component` | Team Lead, Manager | Whole-corpus counts by team × component × severity: log lines, distinct nodes/requests/instances, active days, first/last seen | ≤100 groups; summary covers all |
+| `summarize_by_team_and_component` | Team Lead, Manager | Whole-corpus counts by team × component × severity: log lines, distinct nodes/instances, active days, first/last seen, **`burst_count_30m`** (lines <30 min apart = one burst, via `LAG`), **`top_node_share_pct`** (one faulty node vs widespread), **`current_period_bursts` vs `previous_period_bursts`, `growth_pct`** | ≤100 groups; summary covers all |
+| `get_priority_ranking` | Manager | Deterministic 0–100 `priority_score` = weighted `PERCENT_RANK()`s of bursts (0.30), burst growth (0.15), breadth (0.20), active days (0.15) and severity (0.20), every factor returned; envelope lists `unknown_not_in_logs` | ≤100 groups |
+| `get_latency_outliers` | Engineer, Team Lead | Per component × operation median + MAD over the whole corpus; returns calls above `max(median + k·MAD, median + min_excess_sec)` with `ratio_to_median`, request/instance IDs and `silent_info_level` | ≤100 rows |
 | `get_recurring_trends` | Team Lead, Manager | Hour/day/week buckets per component, with per-component persistence, peak and pattern (burst / chronic / increasing / decreasing) | hourly ≤31 days; ≤150 rows |
 | `get_openstack_latency_and_errors` | All | Per service or HTTP route: requests, 4xx/5xx, 5xx rate, ERROR/WARNING lines, anomalous instances, AVG/P50/P95/P99/MAX latency | ≤100 groups |
 | `manage_workspace_index` | All (optional) | Agent-managed partial full-text index over one time window: create / benchmark / list / drop | ≤3 indexes |
@@ -154,7 +156,16 @@ All roles share one agent (`src/agent.py`), the same tools and the same corpus. 
 | Evidence | `search_logs` → `get_nearby_events` (same node), latency for OpenStack | `summarize_by_team_and_component` → `get_recurring_trends` → 5 representative lines | `get_corpus_scope` → summary (BOTH) → trends → service health |
 | Output | Timeline, technical hypothesis, concrete diagnostic checks | Frequency/trend table, ownership, ranked team queue | Top-3 priority matrix, actions per team, scope disclaimer |
 
-**Grounding validator** (`src/validator.py`). After each answer, every number is checked against the numbers in the evidence the agent actually received. Rounding to the precision shown, `k/M/B` suffixes and percent-as-fraction are allowed, and `(derived: a/b = x%)` figures are exempt. For the Manager, sentences making revenue, cost, SLA, customer-impact or downtime claims are rejected, unless they state that such data is absent. On failure the agent gets one revision round with the specific problems listed. The UI shows the result of this check next to every answer.
+**Evidence IDs and claim verifier** (`src/claim_verifier.py`).
+- Every tool result carries an `evidence_id`: `EV-01`, `EV-02`, … per question in the agent, per process in the MCP server.
+- Prompts require every factual sentence, bullet or table row to cite its source, e.g. `… 626,450 lines [EV-02].`
+- `verify_response_claims(text, ledger, role)` checks each number against **the evidence it cites**, not just any evidence, and reports a deterministic `verified_number_rate`. It accepts rounding, k/M/B and million/billion suffixes, and percentages stored as fractions.
+- `(derived: …)` figures are exempt, and their arithmetic is evaluated with a restricted AST evaluator (no `eval`). Prose dates, list ordinals and table header labels are skipped, and a citation at the end of a bullet covers the whole bullet.
+- For the Manager, sentences claiming $, revenue, financial, customer impact, SLA breach or downtime % are flagged. Sentences that state the data is absent, and bullets under headings like *What the logs do not establish*, are allowed. Failing answers get one revision round; anything still unsupported is stripped.
+- Each role's required sections are checked too.
+- Verification takes about 1–2 ms per answer, because each evidence item's numbers are indexed when the tool result arrives.
+
+**Earlier grounding validator** (`src/validator.py`). After each answer, every number is checked against the numbers in the evidence the agent actually received. Rounding to the precision shown, `k/M/B` suffixes and percent-as-fraction are allowed, and `(derived: a/b = x%)` figures are exempt. For the Manager, sentences making revenue, cost, SLA, customer-impact or downtime claims are rejected, unless they state that such data is absent. On failure the agent gets one revision round with the specific problems listed. The UI shows the result of this check next to every answer.
 
 ## Worked investigation (measured on the full corpus)
 
@@ -168,6 +179,14 @@ All roles share one agent (`src/agent.py`), the same tools and the same corpus. 
 
   Weekly trends classify KERNEL as *chronic, dominated by one burst* (active in 100% of weeks; the week of 2005-06-13 holds 60.3%), APP as *increasing*, and MMCS as a *burst*.
 - **Manager.** OpenStack `nova-compute` has **192** ERROR lines and all **100** labelled-anomaly lines (**4** anomalous instances). `nova-api` served **98,733** requests with **2** HTTP 5xx, P50 **0.26 s** and P99 **0.51 s**. Scope: 4,747,963 BGL lines over 214.7 days and 207,820 OpenStack lines over 2.7 days.
+
+### Bursts, priority and outliers (measured on the full corpus)
+
+- **KERNEL FATAL:** 626,450 lines are only **501 bursts**; the noisiest node holds 24.3% of the lines; bursts fell 17.2% in the second half of the span.
+- **APP FATAL:** 228,536 lines spread over 1,034 nodes (top node 0.13%, so widespread), and bursts **grew 49.6%**.
+- **`get_priority_ranking(BOTH)`:** KERNEL FATAL 91.8, APP FATAL 86.4, DISCOVERY SEVERE 77.1, DISCOVERY ERROR 69.2, OpenStack nova-compute ERROR 64.8.
+- **`get_latency_outliers`:** finds **6 VM spawns** up to **50.7 s** against a 19.7 s median (MAD 0.42 s). All were logged at **INFO**, so no error-based query would surface them. The spawn, build, destroy and deallocate timings come from nova-compute `Took X seconds to …` lines, parsed into `operation` / `duration_sec`.
+- **Latency:** the burst aggregation adds a window sort. The error summary takes ~1.0 s, a 1-week window 57 ms, and all 4.7M lines ~2.9 s. Priority ranking takes ~0.7 s and outliers ~0.18 s.
 
 ## Optional extensions
 
@@ -191,14 +210,15 @@ The files are sorted by `Timestamp`, so SereneDB fetches only row groups whose m
 ## Tests
 
 ```bash
-uv run pytest -q              # 61 offline tests: query layer on DuckDB, validator, agent loop, semantic KNN, SQL guardrails
-uv run pytest -q -m serenedb  # 16 live tests against the loaded SereneDB (incl. extensions, guarded SQL, read-only role)
+uv run pytest -q              # 81 offline tests: query layer on DuckDB, claim verifier, agent loop, bursts/priority/outliers, KNN, SQL guardrails
+uv run pytest -q -m serenedb  # 18 live tests against the loaded SereneDB (incl. extensions, guarded SQL, read-only role)
 ```
 
 The offline suite runs the repo's real `sql/` files and query templates on DuckDB, a near-identical dialect, against fixture logs. Expected values are computed directly from the fixture files. Full-text modes need SereneDB and are covered by the live suite.
 
 ## Design notes and known limitations
 
+- **Index publish step.** After the bulk load, `sql/02` runs `VACUUM (REFRESH_TABLE)`, `VACUUM (COMPACT_TABLE)` and `VACUUM (RECOMPUTE_STATS_TABLE)` on both tables. All rows are then searchable, segments are merged and statistics are fresh before the first query. A bare `VACUUM;` is a documented no-op on SereneDB tables, so it isn't used.
 - **Full-text search** uses SereneDB's `@@` operator, which only resolves against an inverted-index relation. `search_logs` therefore reads `FROM <table>_idx` and joins back to the table on `line_id` for time, component and severity filters.
 - **Timestamps are bound as ISO text with `::TIMESTAMP`.** SereneDB 26.10.1 rejects binary-encoded timestamp parameters in queries that join an inverted index.
 - **Remote Parquet is queried with `read_parquet('<url>')` directly.** A time filter on a view over it was not pushed down (it scanned the whole file).
