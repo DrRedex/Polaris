@@ -6,7 +6,9 @@
 altair==6.3.0
     # via streamlit
 annotated-doc==0.0.5
-    # via typer
+    # via
+    #   fastapi
+    #   typer
 annotated-types==0.8.0
     # via pydantic
 anyio==4.15.1
@@ -15,6 +17,8 @@ anyio==4.15.1
     #   httpx2
     #   mcp
     #   openai
+    #   pydantic-ai-slim
+    #   pydantic-graph
     #   sse-starlette
     #   starlette
     #   streamlit
@@ -30,7 +34,9 @@ certifi==2026.7.22
 cffi==2.1.1 ; platform_python_implementation != 'PyPy'
     # via cryptography
 charset-normalizer==3.5.2
-    # via requests
+    # via
+    #   reportlab
+    #   requests
 click==8.5.0
     # via
     #   huggingface-hub
@@ -44,6 +50,8 @@ colorama==0.4.6 ; sys_platform == 'win32'
     #   typer
 cryptography==50.0.2
     # via pyjwt
+fastapi==0.143.5
+    # via making-sense-of-logs
 filelock==4.2.1
     # via
     #   huggingface-hub
@@ -52,6 +60,10 @@ fsspec==2026.9.0
     # via
     #   huggingface-hub
     #   torch
+genai-prices==0.1.13
+    # via pydantic-ai-slim
+griffelib==2.3.2
+    # via pydantic-ai-slim
 h11==0.16.0
     # via
     #   httpcore
@@ -67,8 +79,10 @@ httpx==0.28.1
     # via huggingface-hub
 httpx2==2.13.1
     # via
+    #   genai-prices
     #   mcp
     #   openai
+    #   pydantic-ai-slim
 httpx2-jsfetch==1.0 ; python_full_version >= '3.12' and sys_platform == 'emscripten'
     # via httpx2
 huggingface-hub==1.33.0
@@ -99,6 +113,8 @@ jsonschema==4.26.0
     #   mcp
 jsonschema-specifications==2025.9.1
     # via jsonschema
+logfire-api==5.2.0
+    # via pydantic-graph
 markdown-it-py==4.2.0
     # via rich
 markupsafe==3.0.4
@@ -140,9 +156,14 @@ numpy==2.5.4 ; python_full_version >= '3.12'
     #   streamlit
     #   transformers
 openai==3.33.0
-    # via making-sense-of-logs
+    # via
+    #   making-sense-of-logs
+    #   pydantic-ai-slim
 opentelemetry-api==1.45.1
-    # via mcp
+    # via
+    #   fastapi
+    #   mcp
+    #   pydantic-ai-slim
 packaging==26.3
     # via
     #   altair
@@ -154,7 +175,9 @@ pandas==3.0.6
     #   making-sense-of-logs
     #   streamlit
 pillow==12.3.0
-    # via streamlit
+    # via
+    #   reportlab
+    #   streamlit
 protobuf==7.36.2
     # via streamlit
 psycopg==3.3.6
@@ -167,12 +190,20 @@ pycparser==3.11 ; implementation_name != 'PyPy' and platform_python_implementati
     # via cffi
 pydantic==2.14.1
     # via
+    #   fastapi
+    #   genai-prices
     #   making-sense-of-logs
     #   mcp
     #   mcp-types
     #   openai
+    #   pydantic-ai-slim
+    #   pydantic-graph
+pydantic-ai-slim==2.57.0
+    # via making-sense-of-logs
 pydantic-core==2.50.1
     # via pydantic
+pydantic-graph==2.57.0
+    # via pydantic-ai-slim
 pydeck==0.9.3
     # via streamlit
 pygments==2.21.0
@@ -200,9 +231,15 @@ referencing==0.37.0
     #   jsonschema
     #   jsonschema-specifications
 regex==2026.9.29
-    # via transformers
+    # via
+    #   tiktoken
+    #   transformers
+reportlab==5.0.1
+    # via making-sense-of-logs
 requests==2.34.2
-    # via streamlit
+    # via
+    #   streamlit
+    #   tiktoken
 rich==15.0.0
     # via
     #   making-sense-of-logs
@@ -239,6 +276,7 @@ sse-starlette==3.5.0
     # via mcp
 starlette==1.8.0
     # via
+    #   fastapi
     #   mcp
     #   sse-starlette
     #   streamlit
@@ -248,6 +286,8 @@ sympy==1.14.0
     # via torch
 threadpoolctl==3.7.0
     # via scikit-learn
+tiktoken==0.14.0
+    # via pydantic-ai-slim
 tokenizers==0.23.3
     # via
     #   sentence-transformers
@@ -279,6 +319,7 @@ typing-extensions==4.16.0
     # via
     #   altair
     #   anyio
+    #   fastapi
     #   httpx2
     #   huggingface-hub
     #   mcp
@@ -296,8 +337,11 @@ typing-extensions==4.16.0
     #   typing-inspection
 typing-inspection==0.4.4
     # via
+    #   fastapi
     #   mcp
     #   pydantic
+    #   pydantic-ai-slim
+    #   pydantic-graph
 tzdata==2026.5 ; sys_platform == 'emscripten' or sys_platform == 'win32'
     # via
     #   pandas
@@ -306,6 +350,7 @@ urllib3==2.8.0
     # via requests
 uvicorn==0.54.0
     # via
+    #   making-sense-of-logs
     #   mcp
     #   streamlit
 watchdog==6.0.0 ; sys_platform != 'darwin'

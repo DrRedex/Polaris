@@ -17,6 +17,10 @@ dependencies = [
     "sentence-transformers>=3.0.0",
     "torch>=2.5.0",
     "sqlglot>=25.0.0",
+    "fastapi>=0.143.5",
+    "uvicorn>=0.54.0",
+    "reportlab>=5.0.1",
+    "pydantic-ai-slim[openai]>=2.57.0",
 ]
 
 [dependency-groups]

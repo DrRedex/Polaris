@@ -134,7 +134,7 @@ def test_unsafe_queries_rejected(agent, sql, message):
 
 def test_limit_added_clamped_or_kept(agent):
     assert agent.apply_guardrails("SELECT * FROM bgl_logs").endswith("LIMIT 50;")
-    assert agent.apply_guardrails("SELECT * FROM bgl_logs", max_limit=500).endswith("LIMIT 100;")
+    assert agent.apply_guardrails("SELECT * FROM bgl_logs", max_limit=500).endswith("LIMIT 50;")
     assert agent.apply_guardrails("SELECT * FROM bgl_logs LIMIT 100000").endswith("LIMIT 50;")
     assert agent.apply_guardrails("SELECT * FROM bgl_logs LIMIT 7").endswith("LIMIT 7;")
     # A LIMIT inside a subquery does not bound the outer query.

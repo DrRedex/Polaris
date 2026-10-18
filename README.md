@@ -2,6 +2,8 @@
 
 National AI Hackathon 2026 (SchubKI) · SereneDB challenge
 
+> **Evidence status:** Some benchmark figures below are historical repository claims whose original run timestamps and raw evidence were not preserved. They are not current measurements. See [docs/PERFORMANCE_AND_AWARDS.md](docs/PERFORMANCE_AND_AWARDS.md) for timestamped runs and explicit unavailable/skipped states.
+
 One AI agent, one log corpus, three audiences. An **Engineer** asks what failed and what happened around it, a **Team Lead** asks which problems recur and who owns them, and a **Manager** asks what deserves attention first. Each gets a different investigation, different evidence and different recommendations, not just a shorter or longer answer.
 
 Millions of log lines don't fit in an LLM context window, so the work is split:
@@ -51,9 +53,12 @@ uv run python scripts/load_corpus.py
 
 # 3. Use it
 uv run streamlit run ui/streamlit_app.py           # three-role web UI on http://localhost:8501
+uv run uvicorn src.api.main:app --host 0.0.0.0 --port 8000 # Polaris FastAPI for the Next.js dashboard
 uv run python ui/cli_demo.py --role all            # terminal demo
 uv run python scripts/run_worked_investigation.py  # regenerates docs/worked_investigation.md
 ```
+
+The Polaris dashboard in `frontend/` uses `POST /api/investigate` and `POST /api/reports/pdf` on this API. It defaults to `http://localhost:8000`; set `NEXT_PUBLIC_POLARIS_API_URL` in `frontend/.env.local` to change the API origin. The API checks SereneDB connectivity on startup and uses `OPENAI_API_KEY` (and optionally `OPENAI_MODEL`) for SQL generation and structured role responses. The configured role DSNs (`SERENEDB_ENGINEER_DSN`, `SERENEDB_TEAM_LEAD_DSN`, and `SERENEDB_MANAGER_DSN`) must be present for their respective role investigations.
 
 With `make`, these steps are `make setup`, `make ingest`, `make ui`, `make cli` and `make demo`.
 
@@ -80,6 +85,8 @@ Claude Desktop (`claude_desktop_config.json`):
 
 The server's instructions tell the client the evidence rules and the per-role tool flows. Run `python -m src.mcp_server --transport streamable-http` to serve it over HTTP on port 8000.
 
+**Codex CLI:** from the repository root, register the stdio server with `codex mcp add schubki-serenedb-logs -- uv run python -m src.mcp_server`. `.mcp.json` is a portable client-discovery file; Codex CLI stores its own MCP entries in the user's `config.toml`.
+
 ## Tools
 
 | Tool | Roles | What it does | Bounds |
@@ -94,7 +101,7 @@ The server's instructions tell the client the evidence rules and the per-role to
 | `get_openstack_latency_and_errors` | All | Per service or HTTP route: requests, 4xx/5xx, 5xx rate, ERROR/WARNING lines, anomalous instances, AVG/P50/P95/P99/MAX latency | ≤100 groups |
 | `manage_workspace_index` | All (optional) | Agent-managed partial full-text index over one time window: create / benchmark / list / drop | ≤3 indexes |
 | `resolve_semantic_schema` | All | Semantic KNN over a glossary of the real schema: confidence-scored columns, each table's time/id/join columns, the recommended parameterized tool, and a sandbox prompt for writing SQL. Runs no SQL | `k` 1–10 |
-| `execute_guarded_readonly_sql` | All (fallback) | Runs one LLM-written `SELECT` after deterministic guardrails, as a SELECT-only role, returning `executed_sql`, `knn_schema_matches`, exact total and truncation | LIMIT ≤100 (default 50), 30 s timeout |
+| `execute_guarded_readonly_sql` | All (fallback) | Runs one LLM-written `SELECT` after deterministic guardrails, as a SELECT-only role, returning `executed_sql`, `knn_schema_matches`, exact total and truncation | LIMIT ≤50, 30 s timeout |
 | `query_remote_otel_parquet` | All (optional) | Zero-download SQL on the 50B-row OTel Parquet benchmark on S3: footer overview, service summary, Body search | window ≤30 s; 150 s timeout |
 
 Tool arguments are typed and range-checked (Pydantic, enforced by the MCP layer), and every value is bound as a SQL parameter. The eight parameterized tools are the primary path; the LLM writes SQL only through the guarded fallback below.
@@ -115,9 +122,15 @@ For questions none of the parameterized tools can express, a two-step pipeline l
 3. Write and DDL keywords are rejected, but only outside string literals, so `message ILIKE '%delete%'` is allowed.
 4. The query must start with `SELECT` or `WITH`.
 5. The query is parsed with sqlglot, and only `bgl_logs`, `openstack_logs`, `team_ownership` and their `*_idx` full-text indexes may appear. Table functions are rejected: in SereneDB a plain `SELECT * FROM read_csv('/etc/passwd')` reads server files, which a keyword filter alone would allow. System catalogs, other schemas, file-path `FROM '…'` and CTEs that shadow a real table are rejected too.
-6. A top-level `LIMIT` is added (default 50) or clamped (max 100).
+6. A top-level `LIMIT` is added (default 50) or clamped (max 50).
 
 The query then runs as `log_reader`, a SELECT-only database role created by `load_corpus.py`, with a 30 s timeout. The database itself therefore refuses writes even if a check were bypassed. The envelope adds an exact `total_matching_count` (a `COUNT(*)` over the query without its LIMIT) and `is_truncated`.
+
+### Integrated pipeline, role policy, and performance reporting
+
+The four-step entry point is `src.pipeline_orchestrator.run_full_intelligence_pipeline`. It requires an explicit SQL provider (`OPENAI_API_KEY`) or an injected candidate SQL string; it does not invent SQL when configuration is missing. Role-specific production deployments should provision database roles and views with `uv run python scripts/setup_roles.py`, configure the Engineer/Team Lead/Manager DSNs, and set `SERENEDB_APP_ROLE` for each MCP process. This policy uses database grants and aggregate views; native row-level policies are not claimed. Manager denial is only verified when the integration test has a real `SERENEDB_MANAGER_DSN`.
+
+The root `.mcp.json` launches the server from the repository with `uv run python -m src.mcp_server`. Safe benchmark defaults record skipped live work; use `uv run python scripts/benchmark_indexing.py --live` for the local reversible workspace benchmark or `uv run python scripts/benchmark_huge_datasets.py --live --partitions 1` for one bounded remote OTel partition. Multi-partition scans additionally require `--confirm-multpartition`. `make benchmarks` runs the safe defaults and focused tests.
 
 The Streamlit page has a *Semantic schema & guarded SQL* panel that shows the KNN confidence table, the sandbox prompt, an optional OpenAI-generated candidate, and the executed SQL.
 

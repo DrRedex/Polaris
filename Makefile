@@ -1,7 +1,7 @@
 # One-command targets. Windows without make: run the commands shown under each target.
 PY ?= uv run python
 
-.PHONY: setup db sample ingest mcp ui cli demo test test-live clean
+.PHONY: setup db sample ingest mcp ui cli demo test test-live benchmarks clean
 
 setup:            ## install dependencies and start SereneDB
 	uv sync
@@ -37,6 +37,11 @@ test:             ## offline tests (DuckDB stand-in, no server or API key)
 
 test-live:        ## tests against the running, loaded SereneDB
 	uv run pytest -q -m serenedb
+
+benchmarks:       ## safe benchmark defaults (live DB/S3 work requires explicit --live)
+	uv run python scripts/benchmark_indexing.py
+	uv run python scripts/benchmark_huge_datasets.py
+	uv run pytest -q tests/test_pipeline_steps_1_to_4.py tests/test_semantic_and_guardrails.py tests/test_extensions.py
 
 clean:
 	rm -rf data/processed .pytest_cache

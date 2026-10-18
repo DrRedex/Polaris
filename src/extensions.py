@@ -16,6 +16,7 @@ query_remote_otel_parquet
 """
 
 import math
+import os
 import re
 from datetime import datetime, timedelta
 from typing import Any, Literal, Optional
@@ -55,7 +56,7 @@ def _create_ws(eb: EvidenceBuilder, name: str, table: str, start: datetime, end:
         WHERE event_time >= TIMESTAMP '{_ts(start)}' AND event_time <= TIMESTAMP '{_ts(end)}'
     """)
     eb.query("publish index", f"VACUUM (REFRESH_TABLE) {table}")
-    return round(eb.queries[-2].execution_time_ms + eb.queries[-1].execution_time_ms, 1)
+    return eb.queries[-2].execution_time_ms + eb.queries[-1].execution_time_ms
 
 
 def manage_workspace_index(action: Literal["create", "benchmark", "drop", "list"],
@@ -268,15 +269,20 @@ def query_remote_otel_parquet(action: Literal["overview", "service_summary", "se
                 ORDER BY "Timestamp" LIMIT %s
             """, params + [f"%{escaped}%", limit], timeout_s=REMOTE_TIMEOUT_S)
             total = int(rows[0]["total_matching_count"]) if rows else 0
+            message_chars_truncated = 0
             for r in rows:
                 r.pop("total_matching_count")
-                r["body"] = (r["body"] or "")[:500]
+                raw_body = r["body"] or ""
+                message_chars_truncated += max(0, len(raw_body) - 300)
+                r["body"] = raw_body[:300]
+                if len(raw_body) > 300:
+                    r["message_truncated"] = True
         else:
             raise ValueError(f"unknown action {action!r}")
 
         scan_ms = eb.queries[-1].execution_time_ms
         pruning = _pruning(eb, url, s, e, columns)
-        return eb.envelope(
+        result = eb.envelope(
             data_scope={"source": url, "part": part, "window_start": s, "window_end": e,
                         "additional_filters": {k: v for k, v in
                                                {"service_name": service_name, "severity": severity,
@@ -289,6 +295,7 @@ def query_remote_otel_parquet(action: Literal["overview", "service_summary", "se
                 "row_groups_skipped_pct": round(100 * (1 - pruning["row_groups_read"] / pruning["row_groups_in_file"]), 2)
                 if pruning["row_groups_in_file"] else None,
                 "scan_wall_time_ms": scan_ms,
+                "message_chars_truncated": message_chars_truncated if action == "search_body" else 0,
                 "rows_per_second": round(int(pruning["rows_in_read_row_groups"] or 0) / (scan_ms / 1000))
                 if scan_ms else None,
             },
@@ -297,3 +304,105 @@ def query_remote_otel_parquet(action: Literal["overview", "service_summary", "se
                    "groups (an estimate of network transfer).",
                    f"Windows are capped at {MAX_WINDOW_SECONDS} s (~600k rows per second of log time)."],
         )
+        result["efficiency_telemetry"]["message_chars_truncated"] = message_chars_truncated if action == "search_body" else 0
+        return result
+
+
+def correlate_otel_trace(trace_id: str, num_partitions: int = 1,
+                         confirm_multpartition: bool = False) -> dict[str, Any]:
+    """Find a distributed trace in an explicit prefix of public partitions (Engineer only)."""
+    trace_id = (trace_id or "").strip()
+    if not trace_id or len(trace_id) > 128 or not re.fullmatch(r"[A-Fa-f0-9-]+", trace_id):
+        raise ValueError("trace_id must be 1-128 hexadecimal/dash characters")
+    if not 1 <= int(num_partitions) <= OTEL_PARTS:
+        raise ValueError("num_partitions must be 1-50")
+    if int(num_partitions) > 1 and not confirm_multpartition:
+        raise ValueError("multi-partition trace searches require confirm_multpartition=true")
+    with EvidenceBuilder("correlate_otel_trace") as eb:
+        rows = []
+        message_chars_truncated = 0
+        partitions = [_url(i) for i in range(int(num_partitions))]
+        for part, url in enumerate(partitions):
+            rows.extend(eb.query(f"trace lookup partition {part}", f"""
+                SELECT "Timestamp" AS timestamp, "ServiceName" AS service_name,
+                       "SeverityText" AS severity, "TraceId" AS trace_id,
+                       "SpanId" AS span_id, "Body" AS body
+                FROM read_parquet('{url}') WHERE "TraceId" = %s
+                ORDER BY "Timestamp" LIMIT 50
+            """, [trace_id], timeout_s=REMOTE_TIMEOUT_S))
+        rows.sort(key=lambda row: str(row.get("timestamp", "")))
+        for row in rows[:50]:
+            body = str(row.get("body") or "")
+            message_chars_truncated += max(0, len(body) - 300)
+            row["body"] = body[:300]
+            if len(body) > 300:
+                row["message_truncated"] = True
+        result = eb.envelope(data_scope={"partitions": partitions, "trace_id": trace_id,
+                                       "source": "public OTel Parquet", "query_role": "Engineer"},
+                           rows=rows[:50], is_truncated=len(rows) > 50,
+                           summary={"spans_returned": min(len(rows), 50), "matched": bool(rows),
+                                    "message_chars_truncated": message_chars_truncated},
+                           notes=["TraceId/SpanId fields are queried directly from the selected remote Parquet files.",
+                                  "No match is distinct from inaccessible objects or query errors."])
+        result["efficiency_telemetry"]["message_chars_truncated"] = message_chars_truncated
+        return result
+
+
+def query_otel_scale_summary(num_partitions: int = 1, service_filter: Optional[str] = None,
+                             severity_filter: Optional[str] = None,
+                             confirm_multpartition: bool = False) -> dict[str, Any]:
+    if not 1 <= int(num_partitions) <= OTEL_PARTS:
+        raise ValueError("num_partitions must be 1-50")
+    if int(num_partitions) > 1 and not confirm_multpartition:
+        raise ValueError("multi-partition scans require confirm_multpartition=true")
+    started = __import__("time").perf_counter()
+    partitions = []
+    summaries = []
+    pruning = []
+    matching_rows = 0
+    source_rows = 0
+    windows = []
+    evidence_ids = []
+    price_per_gb = os.getenv("OTEL_SCAN_PRICE_USD_PER_GB")
+    for part in range(int(num_partitions)):
+        env = query_remote_otel_parquet("service_summary", part=part, window_seconds=30,
+                                        service_name=service_filter, severity=severity_filter)
+        partitions.append(_url(part))
+        windows.append(env.get("data_scope", {}))
+        if env.get("evidence_id"):
+            evidence_ids.append(env["evidence_id"])
+        summaries.extend(env.get("rows", []))
+        summary = env.get("summary") or {}
+        pruning.append({"partition": part, "rows_in_file_from_footer": summary.get("rows_in_file"),
+                        "rows_in_read_row_groups_from_footer": summary.get("rows_in_read_row_groups"),
+                        "row_groups_in_file": summary.get("row_groups_in_file"),
+                        "row_groups_read": summary.get("row_groups_read"),
+                        "column_bytes_read_estimate": summary.get("column_bytes_read")})
+        source_rows += int(summary.get("rows_in_file") or 0)
+        matching_rows += int(env.get("total_matching_count") or 0)
+    byte_estimate = sum(int(item.get("column_bytes_read_estimate") or 0) for item in pruning)
+    cost = None
+    cost_reason = "No explicit OTEL_SCAN_PRICE_USD_PER_GB configured." if not price_per_gb else None
+    if price_per_gb:
+        try:
+            price_value = float(price_per_gb)
+            if not math.isfinite(price_value) or price_value < 0:
+                raise ValueError
+            cost = byte_estimate / 1_000_000_000 * price_value
+        except ValueError:
+            cost_reason = "OTEL_SCAN_PRICE_USD_PER_GB must be a finite nonnegative USD/GB value."
+    return {"status": "success", "partitions": partitions,
+            "evidence_ids": evidence_ids,
+            "filters": {"service": service_filter, "severity": severity_filter},
+            "query_windows": windows,
+            "distribution": summaries, "total_rows_queried": matching_rows,
+            "matching_rows_in_selected_window": matching_rows,
+            "total_source_rows_from_footer": source_rows or None,
+            "partition_pruning_metadata": pruning,
+            "estimated_scanned_column_bytes_from_footer": byte_estimate or None,
+            "estimated_cloud_scan_cost_formula": "estimated_column_bytes / 1,000,000,000 * OTEL_SCAN_PRICE_USD_PER_GB",
+            "estimated_cloud_scan_cost_unit_price_usd_per_gb": price_per_gb,
+            "elapsed_ms": round((__import__("time").perf_counter()-started)*1000, 1),
+            "rows_scanned": None, "rows_scanned_reason": "SereneDB scan counters are not exposed by this client path.",
+            "estimated_cloud_scan_cost_usd": cost,
+            "estimated_cloud_scan_cost_reason": cost_reason or "Estimate uses compressed column bytes from Parquet footer row-group metadata; not a provider invoice."}

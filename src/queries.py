@@ -715,6 +715,34 @@ def get_recurring_trends(dataset: str, bucket_size: BucketSize = "week",
         )
 
 
+def get_30min_burst_summary(dataset: Dataset, start_time: str, end_time: str,
+                            limit: int = 100) -> dict[str, Any]:
+    """Fixed half-hour buckets on [start_time, end_time); timestamps with offsets normalize to UTC."""
+    dataset = _dataset(dataset)
+    start, end = _parse_time(start_time, "start_time"), _parse_time(end_time, "end_time")
+    if start is None or end is None or start >= end:
+        raise ValueError("start_time and end_time are required and start_time must be earlier")
+    limit = _clamp(limit, 1, MAX_AGG_ROWS)
+    table = DATASET_TABLES[dataset]
+    bucket = "date_trunc('hour', event_time) + CASE WHEN EXTRACT(MINUTE FROM event_time) >= 30 " \
+             "THEN INTERVAL '30 minutes' ELSE INTERVAL '0 minutes' END"
+    with EvidenceBuilder("get_30min_burst_summary") as eb:
+        rows = eb.query("fixed 30-minute log and anomaly buckets", f"""
+            SELECT {bucket} AS window_start, component, severity, COUNT(*) AS log_lines,
+                   COUNT(*) FILTER (WHERE is_anomaly) AS anomaly_lines
+            FROM {table}
+            WHERE event_time >= %s::TIMESTAMP AND event_time < %s::TIMESTAMP
+            GROUP BY 1, 2, 3 ORDER BY 1, log_lines DESC, component, severity LIMIT %s
+        """, [_ts(start), _ts(end), limit])
+        return eb.envelope(data_scope={"dataset": dataset, "window_start_inclusive": start.isoformat(),
+                                       "window_end_exclusive": end.isoformat(), "bucket_minutes": 30},
+                           rows=rows, total_matching_count=sum(int(r["log_lines"]) for r in rows),
+                           is_truncated=len(rows) >= limit,
+                           summary={"groups_returned": len(rows), "log_lines_in_returned_groups": sum(int(r["log_lines"]) for r in rows)},
+                           notes=["Buckets use fixed clock boundaries at :00 and :30; query range is start-inclusive/end-exclusive.",
+                                  "Total is the sum for returned groups and may be incomplete when the group limit is reached."])
+
+
 def _trend_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     buckets = sorted({r["time_bucket"] for r in rows})
     per_comp: dict[str, dict[str, int]] = {}

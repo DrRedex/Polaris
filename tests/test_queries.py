@@ -135,3 +135,11 @@ def test_timezone_offset_converted_to_utc():
     from src.queries import _parse_time
     assert _parse_time("2005-06-03T02:00:00+02:00", "t").isoformat() == "2005-06-03T00:00:00"
     assert _parse_time("2005-06-03T00:00:00Z", "t").isoformat() == "2005-06-03T00:00:00"
+
+
+def test_fixed_30_minute_burst_query_has_explicit_boundary_and_columns(db):
+    env = q.get_30min_burst_summary("BGL", "2005-06-01T00:00:00Z", "2005-06-03T00:00:00Z")
+    assert env["data_scope"]["bucket_minutes"] == 30
+    assert env["data_scope"]["window_end_exclusive"].startswith("2005-06-03")
+    if env["rows"]:
+        assert {"window_start", "component", "severity", "log_lines", "anomaly_lines"} <= set(env["rows"][0])

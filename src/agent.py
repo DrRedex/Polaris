@@ -14,6 +14,7 @@ Environment: OPENAI_API_KEY, OPENAI_MODEL (default gpt-4o), loaded from .env.
 import asyncio
 import concurrent.futures
 import json
+import math
 import os
 import time
 from typing import Any, Callable, Coroutine, Optional
@@ -24,6 +25,7 @@ from pydantic import BaseModel
 from src.mcp_server import mcp
 from src.prompts import Role, missing_sections, system_prompt
 from src.claim_verifier import ClaimReport, index_evidence, verify_response_claims
+from src.db import to_llm_evidence_view
 
 load_dotenv()
 
@@ -50,6 +52,10 @@ class AgentResult(BaseModel):
     evidence_ledger: dict[str, dict[str, Any]]
     revised_after_validation: bool
     usage: dict[str, int]
+    usage_available: bool = False
+    elapsed_ms: float
+    estimated_cost_usd: Optional[float] = None
+    cost_unavailable_reason: Optional[str] = None
 
 
 def _run(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -95,6 +101,7 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
               on_event: Optional[Callable[[str, dict[str, Any]], None]] = None) -> AgentResult:
     """Answers one question for one role. on_event(kind, data) reports progress
     ("tool_call", "tool_result", "revising") for live UIs."""
+    started = time.perf_counter()
     client = client or _client()
     model = model or os.getenv("OPENAI_MODEL", "gpt-4o")
     emit = on_event or (lambda kind, data: None)
@@ -106,10 +113,13 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
     records: list[ToolCallRecord] = []
     ledger: dict[str, dict[str, Any]] = {}
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    usage_available = False
 
     def complete(tool_choice: str) -> Any:
+        nonlocal usage_available
         resp = client.chat.completions.create(model=model, messages=messages, tools=tools, tool_choice=tool_choice)
         if getattr(resp, "usage", None):
+            usage_available = True
             usage["prompt_tokens"] += resp.usage.prompt_tokens or 0
             usage["completion_tokens"] += resp.usage.completion_tokens or 0
         return resp.choices[0].message
@@ -136,7 +146,13 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
             else:
                 emit("tool_call", {"name": tc.function.name, "arguments": args})
                 t0 = time.perf_counter()
-                envelope, error = call_tool(tc.function.name, args)
+                manager_forbidden = {"search_logs", "get_nearby_events", "get_latency_outliers",
+                                     "execute_guarded_readonly_sql", "correlate_otel_trace"}
+                is_remote_body = tc.function.name == "query_remote_otel_parquet" and args.get("action") == "search_body"
+                if role == Role.MANAGER and (tc.function.name in manager_forbidden or is_remote_body):
+                    envelope, error = None, "Manager role cannot access raw log rows, message payloads, or trace details. Use aggregate tools."
+                else:
+                    envelope, error = call_tool(tc.function.name, args)
                 elapsed = (time.perf_counter() - t0) * 1000
             evidence_id = None
             if envelope is not None:
@@ -152,7 +168,7 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": json.dumps(envelope, default=str) if envelope is not None else f"ERROR: {error}",
+                "content": json.dumps(to_llm_evidence_view(envelope), default=str) if envelope is not None else f"ERROR: {error}",
             })
 
     _drop_workspace_indexes_created(records)
@@ -180,9 +196,25 @@ def run_agent(role: Role, question: str, *, client: Any = None, model: Optional[
         report = verify_response_claims(answer, ledger, role.value, mode="strip")
         answer = report.cleaned_text
 
+    price_in = os.getenv("OPENAI_INPUT_PRICE_PER_1M")
+    price_out = os.getenv("OPENAI_OUTPUT_PRICE_PER_1M")
+    cost = None
+    reason = None
+    if usage_available and price_in is not None and price_out is not None:
+        try:
+            input_price, output_price = float(price_in), float(price_out)
+            if not math.isfinite(input_price) or not math.isfinite(output_price) or input_price < 0 or output_price < 0:
+                raise ValueError
+            cost = (usage["prompt_tokens"] * input_price + usage["completion_tokens"] * output_price) / 1_000_000
+        except ValueError:
+            reason = "Configured token prices must be numeric USD per 1M tokens."
+    else:
+        reason = "Provider usage metadata or explicit input/output price configuration is unavailable."
     return AgentResult(role=role, question=question, model=model, answer=answer, tool_calls=records,
                        validation=report, missing_sections=missing, evidence_ledger=ledger,
-                       revised_after_validation=revised, usage=usage)
+                       revised_after_validation=revised, usage=usage, usage_available=usage_available,
+                       elapsed_ms=round((time.perf_counter()-started)*1000, 2),
+                       estimated_cost_usd=cost, cost_unavailable_reason=reason)
 
 
 def _drop_workspace_indexes_created(records: list[ToolCallRecord]) -> None:

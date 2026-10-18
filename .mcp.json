@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "schubki-serenedb-logs": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "src.mcp_server"],
+      "env": {"SEMANTIC_WARMUP": "0", "SERENEDB_APP_ROLE": "engineer"}
+    }
+  }
+}

@@ -146,7 +146,11 @@ def get_model():
                 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
                 for name in ("httpx", "huggingface_hub", "sentence_transformers", "transformers"):
                     logging.getLogger(name).setLevel(logging.WARNING)
-                from sentence_transformers import SentenceTransformer  # heavy import, deferred
+                try:
+                    from sentence_transformers import SentenceTransformer  # heavy import, deferred
+                except ImportError as exc:
+                    raise RuntimeError("Semantic grounding requires sentence-transformers and a configured model; "
+                                       "install project dependencies. Synthetic embeddings are not used.") from exc
                 try:
                     model = SentenceTransformer(MODEL_NAME, device="cpu", local_files_only=True)
                 except Exception:
@@ -167,7 +171,8 @@ def get_glossary_matrix() -> np.ndarray:
             if "matrix" not in _state:
                 vectors = model.encode([_anchor_text(item) for item in SERENE_DB_GLOSSARY], show_progress_bar=False)
                 matrix = np.asarray(vectors, dtype=np.float32)
-                _state["matrix"] = matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
+                norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+                _state["matrix"] = np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms > 0)
     return _state["matrix"]
 
 
@@ -180,7 +185,8 @@ def _lookup(table: str, column: str) -> dict[str, str]:
             "recommended_mcp_tool": "summarize_by_team_and_component"}
 
 
-def extract_relevant_schema_context(manager_query: str, k: int = 4) -> list[dict[str, Any]]:
+def extract_relevant_schema_context(manager_query: str, k: int = 4,
+                                    dataset_filter: str | None = None) -> list[dict[str, Any]]:
     """
     KNN over the schema glossary: returns the top-k semantic matches (by cosine
     similarity), followed by the timestamp / identifier / join columns of every matched
@@ -189,20 +195,42 @@ def extract_relevant_schema_context(manager_query: str, k: int = 4) -> list[dict
     Each item: {"confidence_score": float | None, "match_type": "semantic" | "required_context",
                 "schema_match": {table, column, type, description, recommended_mcp_tool}}
     """
-    manager_query = (manager_query or "").strip()
-    if not manager_query or len(manager_query) > 1000:
-        raise ValueError("query must be 1-1000 characters")
-    k = max(1, min(int(k), len(SERENE_DB_GLOSSARY)))
+    manager_query = manager_query.strip() if isinstance(manager_query, str) else ""
+    if not manager_query:
+        return []
+    if len(manager_query) > 1000:
+        raise ValueError("query must be at most 1000 characters")
+    k = int(k)
+    if k <= 0:
+        return []
+    k = min(k, len(SERENE_DB_GLOSSARY))
+
+    if dataset_filter is None:
+        candidate_indices = list(range(len(SERENE_DB_GLOSSARY)))
+    else:
+        aliases = {"bgl": "bgl_logs", "openstack": "openstack_logs", "ownership": "team_ownership",
+                   "team_ownership": "team_ownership"}
+        normalized_filter = aliases.get(dataset_filter.strip().lower())
+        if normalized_filter is None:
+            raise ValueError("dataset_filter must be BGL, OpenStack, or team_ownership")
+        candidate_indices = [i for i, item in enumerate(SERENE_DB_GLOSSARY) if item["table"] == normalized_filter]
+        if not candidate_indices:
+            return []
 
     query_vector = np.asarray(_encode(manager_query), dtype=np.float32).reshape(1, -1)
-    norm_query = query_vector / np.linalg.norm(query_vector, axis=1, keepdims=True)
-    similarities = np.dot(norm_query, get_glossary_matrix().T)[0]
-    top_indices = np.argsort(similarities)[::-1][:k]
+    query_norm = float(np.linalg.norm(query_vector))
+    if not np.isfinite(query_norm) or query_norm == 0:
+        return []
+    norm_query = query_vector / query_norm
+    matrix = get_glossary_matrix()[candidate_indices]
+    similarities = np.dot(norm_query, matrix.T)[0]
+    top_local = np.argsort(similarities)[::-1][:min(k, len(candidate_indices))]
+    selected = [(candidate_indices[int(i)], float(similarities[int(i)])) for i in top_local]
 
     extracted: list[dict[str, Any]] = [
-        {"confidence_score": round(float(similarities[i]), 4), "match_type": "semantic",
+        {"confidence_score": round(score, 4), "match_type": "semantic",
          "schema_match": SERENE_DB_GLOSSARY[i]}
-        for i in top_indices
+        for i, score in selected
     ]
     seen = {(e["schema_match"]["table"], e["schema_match"]["column"]) for e in extracted}
     for table in dict.fromkeys(e["schema_match"]["table"] for e in extracted):

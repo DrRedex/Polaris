@@ -17,6 +17,7 @@ import functools
 import itertools
 import os
 import threading
+import time
 from typing import Annotated, Any, Literal, Optional
 
 from mcp.server.mcpserver import MCPServer
@@ -24,6 +25,9 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from src import extensions, guarded_sql_agent, queries
+from src.pipeline_orchestrator import run_full_intelligence_pipeline
+from src.predictive_bottleneck import PredictiveBottleneckEngine
+from src.workspace_indexing import create_time_range_index as create_workspace_index, drop_time_range_index as drop_workspace_index
 
 INSTRUCTIONS = """\
 Tools over two Loghub corpora loaded in a local SereneDB: BGL (Blue Gene/L supercomputer,
@@ -75,9 +79,25 @@ def evidence(fn):
     functools.wraps keeps the signature and annotations the MCP schema is built from."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        started = time.perf_counter()
+        configured_role = os.getenv("SERENEDB_APP_ROLE", "engineer").lower()
+        raw_only = {"search_logs", "get_nearby_events", "get_latency_outliers",
+                    "execute_guarded_readonly_sql", "correlate_otel_trace"}
+        if configured_role in {"manager", "team_lead"} and fn.__name__ in raw_only:
+            return {"status": "error", "error": f"{fn.__name__} is not available to SERENEDB_APP_ROLE={configured_role}",
+                    "tool_telemetry": {"elapsed_ms": 0, "status": "denied"}}
+        if configured_role == "manager" and fn.__name__ == "query_remote_otel_parquet" and kwargs.get("action") == "search_body":
+            return {"status": "error", "error": "Manager role cannot access raw OTel Body or trace rows.",
+                    "tool_telemetry": {"elapsed_ms": 0, "status": "denied"}}
+        # Preserve MCP's native isError result for exceptions so the calling agent can
+        # distinguish a failed operation from a successful empty result.
         result = fn(*args, **kwargs)
         if isinstance(result, dict):
-            result = {"evidence_id": next_evidence_id(), **{k: v for k, v in result.items() if k != "evidence_id"}}
+            source_id = result.get("evidence_id")
+            result = {"evidence_id": next_evidence_id(), **({"source_evidence_id": source_id} if source_id else {}),
+                      **{k: v for k, v in result.items() if k != "evidence_id"},
+                      "tool_telemetry": {"elapsed_ms": round((time.perf_counter()-started)*1000, 2),
+                                         "status": result.get("status", "success")}}
         return result
     return wrapper
 
@@ -141,6 +161,14 @@ def get_nearby_events(
     relative_time_sec; the anchor row has is_anchor=true.
     """
     return queries.get_nearby_events(dataset, anchor_line_id, window_lines, same_entity_only, max_seconds)
+
+
+@mcp.tool(annotations=READ_ONLY)
+@evidence
+def get_30min_burst_summary(dataset: DatasetArg, start_time: str, end_time: str,
+                            limit: Annotated[int, Field(ge=1, le=100)] = 100) -> dict[str, Any]:
+    """Group log volume and anomaly counts into fixed half-hour windows on [start, end)."""
+    return queries.get_30min_burst_summary(dataset, start_time, end_time, limit)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -314,6 +342,63 @@ def execute_guarded_readonly_sql(
     executed_sql, knn_schema_matches, exact total_matching_count and is_truncated.
     """
     return guarded_sql_agent.execute_guarded_readonly_sql(user_query, candidate_sql)
+
+
+@mcp.tool(annotations=READ_ONLY)
+@evidence
+def run_dual_engine_investigation(user_query: str, role: Literal["Engineer", "Team Lead", "Manager"] = "Engineer") -> dict[str, Any]:
+    """Run the four-step secured investigation. Requires OPENAI_API_KEY unless candidate SQL is supplied elsewhere."""
+    return run_full_intelligence_pipeline(user_query, role)
+
+
+@mcp.tool(annotations=READ_ONLY)
+@evidence
+def run_proactive_bottleneck_audit(dataset: DatasetArg, start_time: str, end_time: str) -> dict[str, Any]:
+    """Audit measured time buckets; unsupported capacity metrics remain unavailable."""
+    start, end = queries._parse_time(start_time, "start_time"), queries._parse_time(end_time, "end_time")
+    if start is None or end is None or start >= end:
+        raise ValueError("start_time and end_time must be valid and start_time < end_time")
+    trend = queries.get_recurring_trends(dataset, "day", start_time, end_time)
+    audit = PredictiveBottleneckEngine().audit_from_serenedb_trends(trend.get("rows", []), [])
+    audit["evidence_ids"] = [trend["evidence_id"]] if trend.get("evidence_id") else []
+    audit["status"] = "measured" if audit.get("system_health_status") else "unavailable"
+    return audit
+
+
+@mcp.tool(annotations=WORKSPACE)
+@evidence
+def create_time_range_index(dataset: DatasetArg, start_time: str, end_time: str, index_name: str) -> dict[str, Any]:
+    """Create a targeted partial inverted workspace index over a validated time range."""
+    return create_workspace_index(dataset, start_time, end_time, index_name)
+
+
+@mcp.tool(annotations=WORKSPACE)
+@evidence
+def drop_time_range_index(index_name: str) -> dict[str, Any]:
+    """Drop only a temporary workspace index created and registered by this server process."""
+    return drop_workspace_index(index_name)
+
+
+@mcp.tool(annotations=REMOTE)
+@evidence
+def query_otel_scale_summary(num_partitions: Annotated[int, Field(ge=1, le=50)] = 1,
+                             service_filter: Optional[str] = None,
+                             severity_filter: Optional[str] = None,
+                             confirm_multpartition: bool = False) -> dict[str, Any]:
+    """Query bounded OpenTelemetry Parquet partitions directly from S3 (default one)."""
+    return extensions.query_otel_scale_summary(num_partitions, service_filter, severity_filter, confirm_multpartition)
+
+
+@mcp.tool(annotations=REMOTE)
+@evidence
+def correlate_otel_trace(trace_id: Annotated[str, Field(min_length=1, max_length=128)],
+                         num_partitions: Annotated[int, Field(ge=1, le=50)] = 1,
+                         role: Literal["Engineer", "Team Lead", "Manager"] = "Engineer",
+                         confirm_multpartition: bool = False) -> dict[str, Any]:
+    """Return a remote TraceId/SpanId timeline for Engineer investigations; other roles are denied."""
+    if role != "Engineer":
+        raise ValueError("Trace-level output is restricted to Engineer role")
+    return extensions.correlate_otel_trace(trace_id, num_partitions, confirm_multpartition)
 
 
 def main() -> None:

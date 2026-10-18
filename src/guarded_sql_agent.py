@@ -27,8 +27,9 @@ from typing import Any, Optional
 import sqlglot
 from sqlglot import exp
 
-ALLOWED_RELATIONS = {"bgl_logs", "openstack_logs", "team_ownership", "bgl_logs_idx", "openstack_logs_idx"}
-HARD_MAX_LIMIT = 100
+ALLOWED_RELATIONS = {"bgl_logs", "openstack_logs", "team_ownership", "bgl_logs_idx", "openstack_logs_idx",
+                    "v_team_lead_patterns", "v_manager_summary"}
+HARD_MAX_LIMIT = 50
 
 # SereneDB is DuckDB-based: these functions read files, URLs or run nested SQL.
 FORBIDDEN_FUNCTION_RE = re.compile(
@@ -138,7 +139,13 @@ Generated SQL String:"""
             raise UnsafeQueryException("Security Guardrail Violation: empty query.")
         if len(generated_sql) > 8000:
             raise UnsafeQueryException("Security Guardrail Violation: query longer than 8000 characters.")
-        cap = max(1, min(int(max_limit), HARD_MAX_LIMIT))
+        try:
+            requested_cap = int(max_limit)
+        except (TypeError, ValueError):
+            raise UnsafeQueryException("Security Guardrail Violation: max_limit must be an integer from 1 to 50.") from None
+        if requested_cap < 1:
+            raise UnsafeQueryException("Security Guardrail Violation: max_limit must be at least 1.")
+        cap = min(requested_cap, HARD_MAX_LIMIT)
         checks: list[str] = []
 
         # 1. Markdown fences and comments go; literals stay byte-for-byte.
@@ -149,6 +156,8 @@ Generated SQL String:"""
         checks.append("stripped markdown fences, comments and trailing semicolons")
 
         masked = _LITERAL_RE.sub("''", sql)  # string literals cannot trigger keyword checks
+        # Quoted identifiers are parsed structurally below, not treated as executable keywords.
+        masked = re.sub(r'"(?:""|[^"])*"', '""', masked)
 
         # 2. One statement only.
         if ";" in masked:
