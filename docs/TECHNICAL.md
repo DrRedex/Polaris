@@ -2,7 +2,7 @@
 
 National AI Hackathon 2026 (SchubKI) · SereneDB challenge
 
-> **Evidence status:** Some benchmark figures below are historical repository claims whose original run timestamps and raw evidence were not preserved. They are not current measurements. See [docs/PERFORMANCE_AND_AWARDS.md](docs/PERFORMANCE_AND_AWARDS.md) for timestamped runs and explicit unavailable/skipped states.
+> **Evidence status:** The latest verified local and remote runs are recorded below. Older performance figures elsewhere in this document are historical repository claims and were not re-measured in this run. See [docs/PERFORMANCE_AND_AWARDS.md](PERFORMANCE_AND_AWARDS.md) for older timestamped runs and explicit unavailable/skipped states.
 
 One AI agent, one log corpus, three audiences. An **Engineer** asks what failed and what happened around it, a **Team Lead** asks which problems recur and who owns them, and a **Manager** asks what deserves attention first. Each gets a different investigation, different evidence and different recommendations, not just a shorter or longer answer.
 
@@ -132,6 +132,14 @@ The four-step entry point is `src.pipeline_orchestrator.run_full_intelligence_pi
 
 The root `.mcp.json` launches the server from the repository with `uv run python -m src.mcp_server`. Safe benchmark defaults record skipped live work; use `uv run python scripts/benchmark_indexing.py --live` for the local reversible workspace benchmark or `uv run python scripts/benchmark_huge_datasets.py --live --partitions 1` for one bounded remote OTel partition. Multi-partition scans additionally require `--confirm-multpartition`. `make benchmarks` runs the safe defaults and focused tests.
 
+#### Latest verified benchmark run (2026-10-18)
+
+Runs used SereneDB 26.10.1 (PostgreSQL 18.3 wire protocol) with the loaded BGL and OpenStack corpora. In PowerShell, both benchmark scripts were run with `--output $benchOutput`, where `$benchOutput = Join-Path $env:TEMP 'polaris-benchmark-run.md'`; this kept their JSON output outside the repository. Role DSNs were configured, but access-control denial was not tested; per-role model usage, exact engine rows scanned, and OTel cost were unavailable (no scan counters or `OTEL_SCAN_PRICE_USD_PER_GB`).
+
+- **Local partial-index run** (`uv run python scripts/benchmark_indexing.py --live --output $benchOutput`): BGL, `2005-06-03T00:00:00` through `2005-06-17T00:00:00`, 10 sequential samples per arm for each of three queries, no cache flush. The `machine check` full-text count averaged **65.74 ms unindexed** and **22.93 ms indexed** (median 68.98 / 21.94 ms), a **2.87×** speed-up and **42.81 ms** saved per query. Index creation took **892 ms**, cleanup **73 ms**; estimated break-even is **21 queries** excluding cleanup or **23** including cleanup. Nearby-context and component-count queries do not use this full-text index and were slower in the indexed arm; those differences are not index savings. The 50-row context sample had no message truncation or deduplication.
+- **Remote OTel run** (`uv run python scripts/benchmark_huge_datasets.py --live --partitions 1 --output $benchOutput`): one public 1B-row Parquet partition, one 30-second window on 2025-09-23. The query returned **17,463,418** matching rows, read **29 of 1,624** row groups, and estimated **44,158,833 selected-column bytes**. Scale summary elapsed time was **24.72 s**; the complete benchmark including the bounded trace smoke check took **149.99 s**. Engineer trace lookup returned **3 spans**; Team Lead summary and Manager aggregation completed (2,416,801 error/fatal lines across 13 services). These measurements cover one partition, not the entire 50B-row dataset.
+- **Focused tests:** `uv run python -m pytest -q tests/test_pipeline_steps_1_to_4.py tests/test_semantic_and_guardrails.py tests/test_extensions.py` completed with **43 passed, 5 skipped** in 25.81 s. The equivalent `uv run pytest` entrypoint failed before test collection because its Windows launcher could not canonicalize the script path; invoking pytest as a Python module succeeded.
+
 The Streamlit page has a *Semantic schema & guarded SQL* panel that shows the KNN confidence table, the sandbox prompt, an optional OpenAI-generated candidate, and the executed SQL.
 
 ### Evidence envelope
@@ -182,7 +190,7 @@ All roles share one agent (`src/agent.py`), the same tools and the same corpus. 
 
 ## Worked investigation (measured on the full corpus)
 
-`scripts/run_worked_investigation.py` writes the complete transcript with every SQL statement to [`docs/worked_investigation.md`](docs/worked_investigation.md), and re-executes each statement to confirm it reproduces. These are the figures the tools return:
+`scripts/run_worked_investigation.py` writes the complete transcript with every SQL statement to [`docs/worked_investigation.md`](worked_investigation.md), and re-executes each statement to confirm it reproduces. These are the figures the tools return:
 
 - **Engineer.** `search_logs("data TLB error interrupt", phrase, KERNEL, FATAL)` matches **152,734** lines (the BGL `KERNDTLB` alert category). `get_nearby_events` on a representative line shows the same-node sequence around it.
 - **Team Lead.** `summarize_by_team_and_component(BOTH, errors_only)` gives **988,775** error/alert lines.
@@ -193,7 +201,7 @@ All roles share one agent (`src/agent.py`), the same tools and the same corpus. 
   Weekly trends classify KERNEL as *chronic, dominated by one burst* (active in 100% of weeks; the week of 2005-06-13 holds 60.3%), APP as *increasing*, and MMCS as a *burst*.
 - **Manager.** OpenStack `nova-compute` has **192** ERROR lines and all **100** labelled-anomaly lines (**4** anomalous instances). `nova-api` served **98,733** requests with **2** HTTP 5xx, P50 **0.26 s** and P99 **0.51 s**. Scope: 4,747,963 BGL lines over 214.7 days and 207,820 OpenStack lines over 2.7 days.
 
-### Bursts, priority and outliers (measured on the full corpus)
+### Bursts, priority and outliers (historical full-corpus measurements)
 
 - **KERNEL FATAL:** 626,450 lines are only **501 bursts**; the noisiest node holds 24.3% of the lines; bursts fell 17.2% in the second half of the span.
 - **APP FATAL:** 228,536 lines spread over 1,034 nodes (top node 0.13%, so widespread), and bursts **grew 49.6%**.
@@ -203,16 +211,13 @@ All roles share one agent (`src/agent.py`), the same tools and the same corpus. 
 
 ## Optional extensions
 
-**Agent-managed workspace index.** `manage_workspace_index("benchmark", "BGL", "2005-06-03", "2005-06-17", "error")` builds a partial inverted index (`CREATE INDEX … USING inverted … WHERE event_time BETWEEN …`) over the 836,927 lines in that window. Measured result:
-- Creation takes **482 ms**.
-- The same full-text count drops from **85.3 ms to 7.1 ms**, a 12× speed-up, with identical results (216,310).
-- Break-even is **7** queries.
+**Agent-managed workspace index.** `manage_workspace_index("benchmark", "BGL", "2005-06-03", "2005-06-17", "error")` builds a partial inverted index (`CREATE INDEX … USING inverted … WHERE event_time BETWEEN …`). Historical repository measurements (not re-run here) reported 482 ms creation and a 12× speed-up; the latest repeatable run and its configuration are reported above.
 
 While the index exists, `search_logs` automatically uses it for full-text searches whose time window lies inside it (the envelope notes this). The OpenAI agent drops any index it created at the end of each question; index names are derived from the validated window, never supplied.
 
 **50 billion rows without downloading them.** `query_remote_otel_parquet` reads the public OpenTelemetry benchmark (`part_000…part_049.parquet`, 1B rows each) in place:
 
-| Action | Measured |
+| Action | Historical repository measurement (not re-run here) |
 |---|---|
 | `overview`, 1 file | 1,000,000,000 rows, 1,624 row groups, time range: **1.4 s** (footer only) |
 | `overview`, 50 files | **50,000,000,000** rows, 81,209 row groups, a full day: **~115 s** (footers only, batched) |

@@ -2,7 +2,7 @@
 
 **Ask your logs a question in plain English and get an answer where every number links back to the SQL that produced it.** Polaris searches millions of log lines in SereneDB and turns the evidence into role-specific insights for engineers, team leads and managers.
 
-> Built by Rhea and team for the **SchubKI National AI Hackathon 2026** (log processing track).
+> Built by Faiz and Rhea for the **SchubKI National AI Hackathon 2026** (log processing track).
 
 ---
 
@@ -13,7 +13,7 @@
 - **⚡ Investigation across the whole corpus.** SereneDB handles searching, counting, percentiles and trend aggregation; the agent receives compact evidence instead of raw logs.
 - **🛡️ Guarded investigation.** Semantic schema search helps route questions to the right tools. AI-generated SQL is checked by sqlglot and executed through a read-only database role.
 
-> **Performance results:** [Insert newly verified benchmark measurements here.] See [docs/TECHNICAL.md](docs/TECHNICAL.md) for benchmark methodology and evidence status.
+> **Verified benchmarks (2026-10-18):** On a 14-day BGL window, a temporary full-text index reduced the `machine check` query average from 65.74 ms to 22.93 ms (2.87×); estimated break-even was 23 queries including cleanup. A one-partition OTel run returned 17.46M rows in 24.72 s while reading 29/1,624 row groups (~44.2 MB estimated selected-column data). Focused tests: 43 passed, 5 skipped. See [docs/TECHNICAL.md](docs/TECHNICAL.md) for configuration, limitations and evidence details.
 
 ---
 
